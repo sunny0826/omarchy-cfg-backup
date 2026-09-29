@@ -34,6 +34,14 @@ usage() {
   vault scan [--emit-include F] 只读扫描应加密文件（三层信号分级 + 权限告警）
   vault push|list|pull|verify|status   同上，走独立远端 + 可选 age 层
 
+换机迁移（恢复包 · 单文件 + 单口令携带全部凭据）:
+  kit export [--output FILE] [--passphrase-file F]
+                                打包 rclone 凭据 + age 私钥 + 配置 → 一个加密恢复包
+  kit import <kit> [--passphrase-file F]
+                                解开恢复包，回填本机凭据与配置（rclone 远端安全合并）
+  restore <kit> [--yes] [--passphrase-file F] [--target DIR]
+                                一行恢复: import → 预览 → 确认 → cfg+vault 全部落盘
+
 其他:
   widget-status                 状态栏组件数据源（单行 JSON，无网络）
   widget-push                   状态栏一键备份（两仓 + 桌面通知）
@@ -50,37 +58,50 @@ usage() {
 
 安全默认: monitors.lua / *.bak* / 缓存永不进包；pull 永不覆盖 monitors.lua；
 覆盖前原文件改名为 .pre-restore-<时间>；vault 文件落盘后强制 chmod 600。
+恢复包为单个加密文件（AES-256 + PBKDF2），口令与包分离保管，换机仅需两样。
 EOF
 }
 
 # ---------------- 配置 ----------------
 CONFIG_DIR="${OCB_CONFIG_DIR:-$HOME/.config/omarchy-cfg-backup}"
-if [ -f "$CONFIG_DIR/config" ]; then
-  # shellcheck source=/dev/null
-  . "$CONFIG_DIR/config"
-fi
-: "${BACKEND:=rclone}"                       # rclone | local
-: "${REMOTE_CFG:=r2-crypt}"                  # rclone 远端（含 bucket）
-: "${REMOTE_VAULT:=r2-vault-crypt}"
-: "${LOCAL_ROOT:=$HOME/.local/share/omarchy-cfg-backup/remote}"  # BACKEND=local 时
-: "${HOST_TAG:=$(hostname)}"
-: "${KEEP_N:=10}"
-: "${VAULT_USE_AGE:=0}"
-: "${AGE_RECIPIENT:=}"                       # age1... 公钥（加密）
-: "${AGE_IDENTITY:=}"                        # 私钥文件路径（解密）
-: "${ROOT:=$HOME}"                           # 打包/恢复的根（测试可覆写）
-: "${INCLUDE_FILE:=$CONFIG_DIR/include.txt}"
-: "${VAULT_INCLUDE_FILE:=$CONFIG_DIR/vault-include.txt}"
-: "${STATE_DIR:=$HOME/.local/state/omarchy-cfg-backup}"   # 本地状态（供状态栏组件读取）
+_load_config() {
+  if [ -f "$CONFIG_DIR/config" ]; then
+    # shellcheck source=/dev/null
+    . "$CONFIG_DIR/config"
+  fi
+  : "${BACKEND:=rclone}"                       # rclone | local
+  : "${REMOTE_CFG:=r2-crypt}"                  # rclone 远端（含 bucket）
+  : "${REMOTE_VAULT:=r2-vault-crypt}"
+  : "${LOCAL_ROOT:=$HOME/.local/share/omarchy-cfg-backup/remote}"  # BACKEND=local 时
+  : "${HOST_TAG:=$(hostname)}"
+  : "${KEEP_N:=10}"
+  : "${VAULT_USE_AGE:=0}"
+  : "${AGE_RECIPIENT:=}"                       # age1... 公钥（加密）
+  : "${AGE_IDENTITY:=}"                        # 私钥文件路径（解密）
+  : "${ROOT:=$HOME}"                           # 打包/恢复的根（测试可覆写）
+  : "${INCLUDE_FILE:=$CONFIG_DIR/include.txt}"
+  : "${VAULT_INCLUDE_FILE:=$CONFIG_DIR/vault-include.txt}"
+  : "${STATE_DIR:=$HOME/.local/state/omarchy-cfg-backup}"   # 本地状态（供状态栏组件读取）
+}
+_load_config
+
+# kit import 后重新载入配置（清掉旧值，避免新旧配置混血）
+reload_config() {
+  unset BACKEND REMOTE_CFG REMOTE_VAULT LOCAL_ROOT HOST_TAG KEEP_N \
+        VAULT_USE_AGE AGE_RECIPIENT AGE_IDENTITY ROOT INCLUDE_FILE VAULT_INCLUDE_FILE STATE_DIR
+  _load_config
+}
 
 TS="$(date +%Y-%m-%dT%H-%M-%S%z)"
 SUF=".tar.zst"
 WORK=""
 SCAN_TMP=""
+PASS_TMP=""
 cleanup() {
   local rc=$?
   if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
   if [ -n "$SCAN_TMP" ]; then rm -rf "$SCAN_TMP"; fi
+  if [ -n "$PASS_TMP" ]; then rm -f "$PASS_TMP"; fi
   return "$rc"
 }
 trap cleanup EXIT
@@ -93,6 +114,13 @@ need() { command -v "$1" >/dev/null 2>&1 || die "缺少依赖: $1（$2）"; }
 excluded() { [[ $1 =~ $EXCLUDE_RE ]]; }
 
 # ---------------- 远端抽象（rclone | local）----------------
+_rclone_conf_path() { # 与 rclone 自身的配置解析保持一致（RCLONE_CONFIG > XDG > ~/.config）
+  if [ -n "${RCLONE_CONFIG:-}" ]; then
+    printf '%s' "$RCLONE_CONFIG"
+  else
+    printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/rclone/rclone.conf"
+  fi
+}
 _remote_name() { [ "$1" = cfg ] && echo "$REMOTE_CFG" || echo "$REMOTE_VAULT"; }
 
 _remote_put() { # kind localfile key
@@ -525,7 +553,7 @@ setup_provision_tokens() {
   rclone config create r2-vault s3 provider Cloudflare \
     access_key_id "$ak_vault" secret_access_key "$sk_vault" endpoint "$ep" \
     no_check_bucket true >/dev/null
-  chmod 600 "$HOME/.config/rclone/rclone.conf"
+  chmod 600 "$(_rclone_conf_path)"
   info "rclone 远端已配置（$REMOTE_CFG / $REMOTE_VAULT，配置文件 600）"
 
   local rec="$CONFIG_DIR/first-run-secrets.txt"
@@ -649,17 +677,45 @@ do_setup() {
   setup_age
 
   echo
-  echo "== 5/5 首次备份与校验 =="
+  echo "== 5/6 首次备份与校验 =="
   do_push cfg
-  do_push vault
   do_verify cfg
-  do_verify vault
+  if [ -n "$(_collect "$VAULT_INCLUDE_FILE" | head -1)" ]; then
+    do_push vault
+    do_verify vault
+  else
+    step "vault 白名单为空（还没有密钥文件），跳过 vault 备份"
+    note "之后: omarchy-cfg-backup vault scan 发现密钥文件 → 人工确认 → vault push"
+  fi
+
+  echo
+  echo "== 6/6 生成恢复包（换机一行恢复的钥匙）=="
+  local kit_out="$HOME/ocb-recovery-$HOST_TAG-$TS.ocbkit"
+  if [ "$auto" = 1 ]; then
+    local rec="$CONFIG_DIR/first-run-secrets.txt" kpass pf
+    kpass=$(sed -n 's/^\[ocb-kit\] Passphrase = //p' "$rec" 2>/dev/null | head -1 || true)
+    if [ -z "$kpass" ]; then
+      kpass=$(openssl rand -base64 24 | tr -d '\n')
+      umask 077
+      { echo; echo "[ocb-kit] Passphrase = $kpass"; } >> "$rec"
+      chmod 600 "$rec"
+    fi
+    umask 077
+    pf=$(mktemp)
+    printf '%s' "$kpass" > "$pf"
+    do_kit_export --output "$kit_out" --passphrase-file "$pf"
+    rm -f "$pf"
+  else
+    do_kit_export --output "$kit_out"
+  fi
 
   echo
   info "setup 完成！"
+  warn "还差一步（最重要）：把恢复包存好 —— $kit_out"
+  warn "建议放网盘/U 盘/密码管理器附件；恢复口令单独放密码管理器，勿与包同处"
   if [ -f "$CONFIG_DIR/first-run-secrets.txt" ]; then
-    warn "还差一步（最重要）：把 $CONFIG_DIR/first-run-secrets.txt 录入密码管理器，然后 shred -u 删掉它"
-    warn "同时把 $CONFIG_DIR/age-identity.txt 存一份离线副本"
+    warn "并把 $CONFIG_DIR/first-run-secrets.txt 录入密码管理器，然后 shred -u 删掉它"
+    warn "age 私钥 $CONFIG_DIR/age-identity.txt 建议再存一份离线副本"
   fi
   if [ "$auto" != 1 ] && [ -t 0 ]; then
     local ans
@@ -674,6 +730,309 @@ do_setup() {
   note "状态栏: 左键开面板 · 右键立即同步（组件已随 install.sh 安装）"
 }
 
+# ---------------- 恢复包（kit）：单文件 + 单口令携带全部凭据 ----------------
+KIT_MAGIC="OCBKITv1"
+
+_kit_get_passphrase() { # confirm(0|1) [passphrase-file] → stdout 口令（不含换行）
+  local confirm=$1 file="${2:-}" pass pass2
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || die "--passphrase-file 不存在: $file"
+    IFS= read -r pass < "$file" || true
+    [ -n "$pass" ] || die "口令文件为空: $file"
+    printf '%s' "$pass"
+    return 0
+  fi
+  [ -t 0 ] || die "非交互环境请用 --passphrase-file 提供恢复口令"
+  printf '恢复口令（至少 8 位，只存密码管理器，不回显）: ' >&2
+  read -r -s pass; echo >&2
+  [ "${#pass}" -ge 8 ] || die "恢复口令至少 8 位"
+  if [ "$confirm" = 1 ]; then
+    printf '再输一次: ' >&2
+    read -r -s pass2; echo >&2
+    [ "$pass" = "$pass2" ] || die "两次输入不一致"
+  fi
+  printf '%s' "$pass"
+}
+
+_kit_passfile() { # 口令 → 600 临时文件（openssl -pass file: 用），设置 PASS_TMP
+  umask 077
+  PASS_TMP=$(mktemp)
+  printf '%s' "$1" > "$PASS_TMP"
+}
+
+_rclone_block() { # conffile name → stdout 远端配置块（含 [name] 头；不存在则为空）
+  awk -v n="$2" '/^\[/ { if (p) exit; p = ($0 == "[" n "]") } p { print }' "$1"
+}
+
+_rclone_managed_remotes() { # conffile → stdout 本工具管理的远端名（含 crypt 依赖的底层远端）
+  local conf=$1 n base
+  {
+    echo "$REMOTE_CFG"
+    echo "$REMOTE_VAULT"
+    for n in "$REMOTE_CFG" "$REMOTE_VAULT"; do
+      [ -n "$n" ] || continue
+      base=$(_rclone_block "$conf" "$n" | sed -n 's/^remote[[:space:]]*=[[:space:]]*\([^:[:space:]]*\):.*/\1/p' | head -1)
+      [ -n "$base" ] && echo "$base"
+    done
+  } | sort -u
+}
+
+_rclone_merge() { # kitconf targetconf：kit 中的远端块合并进目标 rclone.conf（同名块替换）
+  local kitconf=$1 target=$2 work bak=""
+  [ -s "$kitconf" ] || return 0
+  work=$(mktemp -d)
+  sed -n 's/^\[\(.*\)\]$/\1/p' "$kitconf" > "$work/names"
+  [ -s "$work/names" ] || { rm -rf "$work"; die "恢复包 rclone.conf 异常：无远端定义"; }
+  : > "$work/merged"
+  if [ -f "$target" ]; then
+    awk 'FNR==NR { skip[$0]=1; next }
+         FNR==1 { p=1 }
+         /^\[/ { name=$0; sub(/^\[/,"",name); sub(/\]$/,"",name); p=!(name in skip) }
+         p { print }' "$work/names" "$target" > "$work/merged"
+  fi
+  printf '\n' >> "$work/merged"
+  cat "$kitconf" >> "$work/merged"
+  if [ -f "$target" ]; then
+    bak="$target.pre-restore-$TS"
+    cp -a "$target" "$bak"
+    note "原 rclone.conf 已备份: $bak"
+  fi
+  mkdir -p "$(dirname "$target")"
+  mv "$work/merged" "$target"
+  chmod 600 "$target"
+  rm -rf "$work"
+}
+
+_kit_write_config() { # 输出到 $1：从当前有效状态生成完整 config（换机可直接用）
+  {
+    echo "# omarchy-cfg-backup 配置（kit export 生成，含换机所需全部标识）"
+    echo "BACKEND=$BACKEND"
+    echo "REMOTE_CFG=$REMOTE_CFG"
+    echo "REMOTE_VAULT=$REMOTE_VAULT"
+    [ "$BACKEND" = local ] && echo "LOCAL_ROOT=$LOCAL_ROOT"
+    echo "HOST_TAG=$HOST_TAG"
+    echo "KEEP_N=$KEEP_N"
+    echo "VAULT_USE_AGE=$VAULT_USE_AGE"
+    if [ -n "$AGE_RECIPIENT" ]; then echo "AGE_RECIPIENT=$AGE_RECIPIENT"; fi
+    if [ -n "$AGE_IDENTITY" ]; then echo "AGE_IDENTITY=@AGE_IDENTITY@"; fi
+  } > "$1"
+  return 0
+}
+
+do_kit_export() {
+  local out="" pf=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output) [ $# -ge 2 ] || die "kit export: --output 缺参数"; out=$2; shift 2 ;;
+      --passphrase-file) [ $# -ge 2 ] || die "kit export: --passphrase-file 缺参数"; pf=$2; shift 2 ;;
+      *) die "kit export: 未知选项 $1" ;;
+    esac
+  done
+  need tar "coreutils"; need zstd "pacman -S zstd"; need jq "pacman -S jq"; need openssl "pacman -S openssl"
+  [ -f "$INCLUDE_FILE" ] || die "白名单不存在: $INCLUDE_FILE"
+  [ -n "$out" ] || out="$HOME/ocb-recovery-$HOST_TAG-$TS.ocbkit"
+
+  local pass; pass=$(_kit_get_passphrase 1 "$pf")
+  _kit_passfile "$pass"; pass=""
+
+  WORK=$(mktemp -d)
+  local stage="$WORK/stage"
+  mkdir -p "$stage"
+  _kit_write_config "$stage/config"
+  cp "$INCLUDE_FILE" "$stage/include.txt"
+  [ -f "$VAULT_INCLUDE_FILE" ] && cp "$VAULT_INCLUDE_FILE" "$stage/vault-include.txt"
+  local ident_src=""
+  if [ -f "$CONFIG_DIR/age-identity.txt" ]; then
+    ident_src="$CONFIG_DIR/age-identity.txt"
+  elif [ -n "$AGE_IDENTITY" ] && [ -f "$AGE_IDENTITY" ]; then
+    ident_src="$AGE_IDENTITY"
+  fi
+  if [ -n "$ident_src" ]; then
+    cp "$ident_src" "$stage/age-identity.txt"
+    chmod 600 "$stage/age-identity.txt"
+  fi
+  if [ "$BACKEND" = rclone ]; then
+    local rconf
+    rconf=$(_rclone_conf_path)
+    [ -f "$rconf" ] || rconf="$HOME/.rclone.conf"
+    [ -f "$rconf" ] || die "找不到 rclone.conf（$(_rclone_conf_path)）"
+    local rc_out="$stage/rclone.conf" n blk
+    : > "$rc_out"
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      blk=$(_rclone_block "$rconf" "$n")
+      [ -n "$blk" ] || die "rclone.conf 缺少远端: $n"
+      printf '%s\n\n' "$blk" >> "$rc_out"
+    done < <(_rclone_managed_remotes "$rconf")
+    chmod 600 "$rc_out"
+    info "收录 rclone 远端: $(sed -n 's/^\[\(.*\)\]$/\1/p' "$rc_out" | tr '\n' ' ')"
+  fi
+
+  local files='{}' f
+  for f in "$stage"/*; do
+    [ -f "$f" ] || continue
+    files=$(jq -c --arg n "$(basename "$f")" --arg h "$(sha256sum "$f" | cut -d' ' -f1)" '.[$n]=$h' <<<"$files")
+  done
+  jq -n --arg ver "$KIT_MAGIC" --arg created "$TS" --arg host "$HOST_TAG" \
+        --arg backend "$BACKEND" --arg tool "$VERSION" --argjson files "$files" \
+    '{kit:$ver, created:$created, host_tag:$host, backend:$backend, tool:$tool, files:$files}' > "$stage/kit.json"
+
+  step "打包并加密恢复包（AES-256 + PBKDF2）"
+  tar -C "$stage" --zstd -cf "$WORK/kit.tar.zst" .
+  printf '%s\n' "$KIT_MAGIC" > "$out"
+  openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -salt \
+    -pass "file:$PASS_TMP" -in "$WORK/kit.tar.zst" >> "$out"
+  chmod 600 "$out"
+  rm -rf "$WORK"; WORK=""
+  info "恢复包已生成: $out（$(stat -c %s "$out") 字节）"
+  note "换机只需两样: ① 这个文件 ② 恢复口令（进密码管理器，勿与包放一起）"
+  note "内含: rclone 凭据 · age 私钥 · 配置（HOST_TAG=$HOST_TAG）· 白名单"
+}
+
+do_kit_import() {
+  local kit="" pf=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --passphrase-file) [ $# -ge 2 ] || die "kit import: --passphrase-file 缺参数"; pf=$2; shift 2 ;;
+      -*) die "kit import: 未知选项 $1" ;;
+      *) [ -z "$kit" ] || die "kit import: 只接受一个恢复包"; kit=$1; shift ;;
+    esac
+  done
+  [ -n "$kit" ] || die "用法: kit import <恢复包文件> [--passphrase-file F]"
+  [ -f "$kit" ] || die "恢复包不存在: $kit"
+  need tar "coreutils"; need zstd "pacman -S zstd"; need jq "pacman -S jq"; need openssl "pacman -S openssl"
+
+  local pass; pass=$(_kit_get_passphrase 0 "$pf")
+  _kit_passfile "$pass"; pass=""
+
+  local magic; magic=$(head -n 1 "$kit" 2>/dev/null || true)
+  [ "$magic" = "$KIT_MAGIC" ] || die "不是 omarchy-cfg-backup 恢复包（文件头不符）"
+
+  WORK=$(mktemp -d)
+  step "解密恢复包"
+  if ! tail -c "+$(( ${#KIT_MAGIC} + 2 ))" "$kit" \
+       | openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -pass "file:$PASS_TMP" \
+         > "$WORK/kit.tar.zst" 2>/dev/null; then
+    die "解密失败：恢复口令错误或恢复包损坏"
+  fi
+  zstd -tq "$WORK/kit.tar.zst" 2>/dev/null || die "恢复包损坏（zstd 校验失败）"
+  mkdir -p "$WORK/x"
+  tar -C "$WORK/x" -xf "$WORK/kit.tar.zst"
+  [ -f "$WORK/x/kit.json" ] || die "恢复包内容异常：缺少 kit.json"
+  local f h
+  while IFS=$'\t' read -r f h; do
+    [ -n "$f" ] || continue
+    [ -f "$WORK/x/$f" ] || die "恢复包缺文件: $f"
+    [ "$(sha256sum "$WORK/x/$f" | cut -d' ' -f1)" = "$h" ] || die "恢复包文件哈希不符（疑似被篡改）: $f"
+  done < <(jq -r '.files | to_entries[] | [.key,.value] | @tsv' "$WORK/x/kit.json")
+  info "包完整性校验通过（$(jq -r '.files | length' "$WORK/x/kit.json") 个文件）"
+
+  step "回填凭据与配置 → $CONFIG_DIR"
+  mkdir -p "$CONFIG_DIR"
+  local tgt
+  for f in config include.txt vault-include.txt age-identity.txt; do
+    [ -f "$WORK/x/$f" ] || continue
+    tgt="$CONFIG_DIR/$f"
+    if [ -e "$tgt" ]; then
+      cp -a "$tgt" "$tgt.pre-restore-$TS"
+      note "原文件改名: $f.pre-restore-$TS"
+    fi
+    cp "$WORK/x/$f" "$tgt"
+    chmod 600 "$tgt"
+  done
+  # age 私钥路径重写为本机路径（换机后 HOME/路径可能不同）
+  if [ -f "$CONFIG_DIR/age-identity.txt" ]; then
+    sed -i "s|^AGE_IDENTITY=.*|AGE_IDENTITY=$CONFIG_DIR/age-identity.txt|" "$CONFIG_DIR/config"
+  fi
+  if [ -f "$WORK/x/rclone.conf" ]; then
+    local rconf
+    rconf=$(_rclone_conf_path)
+    step "合并 rclone 远端 → $rconf"
+    _rclone_merge "$WORK/x/rclone.conf" "$rconf"
+    info "rclone 远端已就绪"
+  fi
+  rm -rf "$WORK"; WORK=""
+  reload_config
+  info "凭据回填完成: HOST_TAG=$HOST_TAG · BACKEND=$BACKEND"
+  [ "$VAULT_USE_AGE" = 1 ] && note "vault age 层已启用（私钥: $AGE_IDENTITY）"
+  return 0
+}
+
+do_restore() {
+  local kit="" yes=0 pf="" target="$ROOT"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      --passphrase-file) [ $# -ge 2 ] || die "restore: --passphrase-file 缺参数"; pf=$2; shift 2 ;;
+      --target) [ $# -ge 2 ] || die "restore: --target 缺参数"; target=$2; shift 2 ;;
+      -*) die "restore: 未知选项 $1" ;;
+      *) [ -z "$kit" ] || die "restore: 只接受一个恢复包"; kit=$1; shift ;;
+    esac
+  done
+  [ -n "$kit" ] || die "用法: restore <恢复包文件> [--yes] [--passphrase-file F] [--target DIR]"
+
+  echo "omarchy-cfg-backup restore — 换机一行恢复"
+  echo "（只做恢复，绝不 push；monitors.lua / *.bak* 永不覆盖）"
+  echo
+  echo "== 1/4 回填凭据与配置 =="
+  if [ -n "$pf" ]; then
+    do_kit_import "$kit" --passphrase-file "$pf"
+  else
+    do_kit_import "$kit"
+  fi
+
+  echo
+  echo "== 2/4 环境体检 =="
+  need tar "coreutils"; need zstd "pacman -S zstd"; need jq "pacman -S jq"; need sha256sum "coreutils"
+  [ "$BACKEND" = rclone ] && need rclone "pacman -S rclone"
+  [ "$VAULT_USE_AGE" = 1 ] && need age "pacman -S age"
+  if [ "$BACKEND" = rclone ]; then
+    _remote_reachable cfg || die "远端不可达: $REMOTE_CFG（凭据已回填，检查网络/Token）"
+  fi
+  info "依赖与远端就绪"
+
+  echo
+  echo "== 3/4 云端快照确认（HOST_TAG=$HOST_TAG）=="
+  local cfg_list vault_list
+  cfg_list=$(_remote_list cfg)
+  [ -n "$cfg_list" ] || die "云端没有 cfg 快照（omarchy/$HOST_TAG/）——恢复包的主机标识或凭据可能不对"
+  echo "$cfg_list" | sort -r | sed 's/^/  /'
+  vault_list=$(_remote_list vault)
+  if [ -n "$vault_list" ]; then
+    info "vault 快照存在，将一并恢复密钥"
+  else
+    warn "vault 仓无快照，稍后跳过密钥恢复"
+  fi
+
+  echo
+  echo "== 4/4 恢复（先预览后落盘）=="
+  step "预览 cfg"
+  do_pull cfg --target "$target"
+  if [ -n "$vault_list" ]; then
+    step "预览 vault"
+    do_pull vault --target "$target"
+  fi
+  if [ "$yes" != 1 ]; then
+    [ -t 0 ] || die "非交互环境请加 --yes 确认恢复"
+    local ans="" extra=""
+    [ -n "$vault_list" ] && extra=" + vault"
+    read -r -p "确认恢复 cfg${extra} 到 $target ? [y/N] " ans || ans=""
+    case "$ans" in
+      y|Y) : ;;
+      *) step "已取消（未写入任何文件）"; return 0 ;;
+    esac
+  fi
+  do_pull cfg --yes --target "$target"
+  if [ -n "$vault_list" ]; then
+    do_pull vault --yes --target "$target"
+  fi
+  echo
+  info "换机恢复完成！"
+  note "后续手动步骤: hyprctl reload · omarchy restart shell"
+  note "各 agent 登录态换机后需重新登录（预期行为，不是恢复失败）"
+  note "备份身份沿用 HOST_TAG=$HOST_TAG；如需新身份，编辑 $CONFIG_DIR/config"
+  note "确认无误后 push 即可以当前状态继续备份"
+}
 # ---------------- 状态栏组件支撑 ----------------
 _record_state() { # kind snapname filecount
   mkdir -p "$STATE_DIR"
@@ -828,7 +1187,7 @@ do_doctor() {
   echo
   echo "== 权限 =="
   local f
-  for f in "$HOME/.config/rclone/rclone.conf" "$HOME/.rclone.conf" "$CONFIG_DIR/config"; do
+  for f in "$(_rclone_conf_path)" "$HOME/.rclone.conf" "$CONFIG_DIR/config"; do
     if [ -f "$f" ]; then
       local m; m=$(stat -c %a "$f")
       if [ "$m" = "600" ]; then info "$f ($m)"; else warn "$f 权限 $m，建议 chmod 600"; ok=1; fi
@@ -1033,6 +1392,15 @@ main() {
         *) die "未知 vault 子命令: $sub" ;;
       esac
       ;;
+    kit)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        export) do_kit_export "$@" ;;
+        import) do_kit_import "$@" ;;
+        *) die "kit 用法: kit export | kit import <恢复包>（omarchy-cfg-backup help）" ;;
+      esac
+      ;;
+    restore) do_restore "$@" ;;
     widget-status) do_widget_status "$@" ;;
     widget-push) do_widget_push "$@" ;;
     widget-verify) do_widget_verify "$@" ;;

@@ -7,6 +7,10 @@ CLI="$PROJ/bin/omarchy-cfg-backup"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
+# HOME 隔离：setup/kit 相关路径一律落在临时目录，不碰真实家目录
+export HOME="$T/home"
+mkdir -p "$HOME"
+
 export OCB_CONFIG_DIR="$T/cfg" BACKEND=local LOCAL_ROOT="$T/remote" \
        HOST_TAG=testhost KEEP_N=2 ROOT="$T/root" STATE_DIR="$T/state"
 
@@ -117,6 +121,29 @@ assert "setup 生成 age identity" test -f "$OCB_CONFIG_DIR/age-identity.txt"
 assert "setup 二次执行幂等" grep -q '白名单已存在，跳过' "$T/setup2.log"
 "$CLI" widget-status > "$T/ws3.json" 2>&1
 assert "setup 后 configured=true" bash -c 'test "$(jq -r .configured "$0")" = true' "$T/ws3.json"
+assert "setup 自动生成恢复包" bash -c 'ls "$0"/ocb-recovery-*.ocbkit >/dev/null 2>&1' "$HOME"
+assert "恢复口令写入凭据清单" grep -q '^\[ocb-kit\] Passphrase = ' "$OCB_CONFIG_DIR/first-run-secrets.txt"
+
+echo "== 恢复包（kit export / import）=="
+printf 'test-kit-passphrase' > "$T/pf"; chmod 600 "$T/pf"
+"$CLI" kit export --passphrase-file "$T/pf" --output "$T/kit.ocbkit" > "$T/kit.log" 2>&1
+assert "kit export 成功" test -s "$T/kit.ocbkit"
+assert "kit 权限 600" bash -c 'test "$(stat -c %a "$0")" = 600' "$T/kit.ocbkit"
+assert "kit 文件头正确" bash -c 'test "$(head -n1 "$0")" = OCBKITv1' "$T/kit.ocbkit"
+printf 'wrong-pass' > "$T/pf-bad"; chmod 600 "$T/pf-bad"
+if OCB_CONFIG_DIR="$T/cfg-x" "$CLI" kit import "$T/kit.ocbkit" --passphrase-file "$T/pf-bad" \
+     > "$T/kit-bad.log" 2>&1; then
+  bad "错误口令被拒绝"
+else
+  ok "错误口令被拒绝"
+fi
+assert "错误口令不落盘" bash -c '! test -e "$0/config"' "$T/cfg-x"
+OCB_CONFIG_DIR="$T/cfg-x" "$CLI" kit import "$T/kit.ocbkit" --passphrase-file "$T/pf" > "$T/kit-imp.log" 2>&1
+assert "kit import 成功" test -f "$T/cfg-x/config"
+assert "import 回填 HOST_TAG" grep -q '^HOST_TAG=testhost' "$T/cfg-x/config"
+assert "AGE_IDENTITY 重写为本机路径" grep -q "^AGE_IDENTITY=$T/cfg-x/age-identity.txt" "$T/cfg-x/config"
+assert "age identity 600" bash -c 'test "$(stat -c %a "$0")" = 600' "$T/cfg-x/age-identity.txt"
+assert "import 后白名单齐备" test -f "$T/cfg-x/include.txt"
 
 echo "== 发布站点 =="
 assert "docs/index.html 与 bootstrap.sh 同步" cmp -s "$PROJ/bootstrap.sh" "$PROJ/docs/index.html"

@@ -10,6 +10,8 @@ Omarchy 配置与密钥的**单向加密备份** CLI：打包白名单 → zstd 
 - **白名单 + fail-safe 排除**：`monitors.lua`、`*.bak*`、缓存永不进包、永不被恢复
 - **不可变快照**：时间戳对象 + `latest` + `MANIFEST.json`（逐文件 sha256 + 插件清单）
 - **vault scan**：三层信号（名称/权限/内容特征）自动发现应加密的文件，人工确认后入库
+- **恢复包**：`kit export` 一个加密文件收走全部凭据（rclone / age 私钥 / 配置），换机只需「包 + 口令」两样
+- **一行恢复**：新机器 `curl … | bash -s -- --restore <恢复包>`，凭据回填 + 恢复全自动
 - **安全恢复**：pull 默认 dry-run 预览；覆盖前原文件改名 `.pre-restore-<时间>`；vault 文件强制 600
 - **可验证**：`verify` 定期完整解开核对 sha256，防备份静默腐烂
 - **双后端**：`rclone`（上云）/ `local`（本地目录，离线测试全链路）
@@ -31,12 +33,13 @@ curl -fsSL https://omarchy-backup.guoxudong.io | bash
 3. 自动开通 Cloudflare：登录（浏览器授权一次）→ 建两个桶 → 建限权 Token → 配 rclone 四远端
 4. 自动生成 age 密钥对并启用内层加密
 5. 首次备份两仓 + 完整校验
+6. 自动生成**恢复包**（换机一行恢复的钥匙）
 
-**唯一需要人做的两件事**：浏览器里授权一次 Cloudflare；把生成的凭据清单录入密码管理器。
+**唯一需要人做的两件事**：浏览器里授权一次 Cloudflare；保管好恢复包 + 恢复口令。
 其余全部自动。`setup --dry-run` 可先看计划；`setup --auto` 跳过交互提问。
 
 日常使用只有两条命令：改完配置 `omarchy-cfg-backup push`，出问题 `omarchy-cfg-backup pull`（dry-run 预览）。
-状态栏云朵图标：左键开面板，右键立即同步。
+换机恢复也是一条命令（见下节）。状态栏云朵图标：左键开面板，右键立即同步。
 
 ## 安装（手动分步，可选）
 
@@ -68,7 +71,45 @@ omarchy-cfg-backup verify            # 下载 latest 完整校验一遍
 
 omarchy-cfg-backup vault scan        # 发现应加密的文件（只读）
 omarchy-cfg-backup vault push|pull|verify|status
+
+omarchy-cfg-backup kit export        # 导出恢复包（单文件+单口令，收走全部凭据）
+omarchy-cfg-backup restore <恢复包>   # 换机一行恢复（import → 预览 → 确认落盘）
 ```
+
+## 换机恢复（新 Omarchy 一行命令）
+
+**老机器**导出恢复包（`setup` 结束时已自动生成，可随时重新导出）：
+
+```bash
+omarchy-cfg-backup kit export        # 输两次口令 → ~/ocb-recovery-<host>-<时间>.ocbkit
+```
+
+换机只需要保管**两样东西**（不再需要逐条抄 9+ 个凭据）：
+
+| 保管物 | 放哪 | 说明 |
+|---|---|---|
+| 恢复包 `.ocbkit` | 网盘 / U 盘 / 密码管理器附件 | 内含 rclone 凭据、age 私钥、配置（含 HOST_TAG）、白名单 |
+| 恢复口令 | 密码管理器（**勿与包放一起**） | AES-256 + PBKDF2 加密；丢失即作废，建议 ≥12 位 |
+
+**新机器**一行命令：
+
+```bash
+curl -fsSL https://omarchy-backup.guoxudong.io | bash -s -- --restore ~/ocb-recovery-xxx.ocbkit
+```
+
+自动完成：缺失依赖安装（pacman）→ CLI 安装 → 解开恢复包回填
+rclone 远端 / age 私钥 / HOST_TAG → 云端快照确认 → dry-run 预览 → 确认后
+cfg + vault 全部落盘（`--yes` 跳过确认，`--passphrase-file F` 供脚本化）。
+安全兜底不变：`monitors.lua` 永不覆盖、覆盖前改名 `.pre-restore-*`、vault 强制 600、**绝不 push**。
+
+```bash
+omarchy-cfg-backup restore <恢复包>   # 分步等价命令（交互确认）
+omarchy-cfg-backup kit import <恢复包>  # 只回填凭据与配置，不落盘配置文件
+```
+
+恢复后手动两步：`hyprctl reload`、`omarchy restart shell`；各 agent 登录态
+重新登录即可（**预期行为，不是恢复失败**）。备份身份沿用包里的 `HOST_TAG`
+（一般是老机器 hostname）；想换新身份就改 `~/.config/omarchy-cfg-backup/config`。
 
 ## 配置
 
@@ -133,14 +174,30 @@ omarchy-cfg-backup auto-sync status
 ## 测试
 
 ```bash
-tests/test.sh      # 全部在临时目录进行，不触碰真实家目录与云端
+tests/test.sh      # 单元/冒烟（49 项断言）
+tests/e2e.sh       # e2e：换机恢复全旅程（55 项断言）
 ```
 
-覆盖：打包排除断言（monitors/bak 不进包）、MANIFEST 与插件清单、dry-run、按 id 恢复、
-覆盖保护（pre-restore）、status 差异、verify、轮转、vault 全链路与 600 权限。
+全部在临时目录 + 本地模拟 S3（`rclone serve s3`）中进行，不触碰真实家目录与云端。
+
+`tests/test.sh` 覆盖：打包排除断言（monitors/bak 不进包）、MANIFEST 与插件清单、
+dry-run、按 id 恢复、覆盖保护（pre-restore）、status 差异、verify、轮转、
+vault 全链路与 600 权限、kit export/import 往返、错误口令拒绝、setup 恢复包。
+
+`tests/e2e.sh` 覆盖（与手动测试说再见）：
+
+- **E2E-1** 换机全流程（local 后端 + age vault）：push → kit export → 全新机器
+  `restore` → 逐文件一致 / 600 / monitors 防火墙 / pre-restore / HOST_TAG 回填 /
+  AGE_IDENTITY 路径重写 / doctor / list
+- **E2E-2** 换机全流程（真实 rclone 路径：serve s3 + crypt + age）：凭据链有效性
+  （`list`、`vault verify` 全链路）、rclone.conf 合并语义（保留已有远端、无关远端不外泄）
+- **E2E-3** bootstrap 一行命令（`--restore`），打包产物全链路（CLI/组件落位 + 恢复）
+- **E2E-4** 负面用例：错误口令、篡改包、空云端、非交互未确认——全部必须干净失败、零落盘
 
 ## 安全须知
 
+- **恢复包 = 整套钥匙**（rclone 凭据 + age 私钥 + 配置）：放网盘/U 盘/密码管理器附件；
+  恢复口令单独放密码管理器，勿与包同处。口令丢失即作废，建议 ≥12 位
 - `rclone.conf` 同时含 R2 key 与 crypt 密码——务必 `chmod 600`，且 crypt 密码另存密码管理器 + 离线副本
 - vault 启用 `VAULT_USE_AGE=1` 后多一道独立口令保护；age 私钥（`AGE_IDENTITY`）同样需要异地保管
 - 各类 agent 的 OAuth 登录态会轮转：换机后重新登录是**预期行为**，不是恢复失败

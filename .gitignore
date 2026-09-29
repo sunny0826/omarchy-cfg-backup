@@ -7,6 +7,8 @@ rclone.conf
 *.p12
 .env
 .env.*
+.cloudflare/
+*.ocbkit
 
 # 本地状态与临时文件
 state/
