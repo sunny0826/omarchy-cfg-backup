@@ -10,8 +10,8 @@ Omarchy 配置与密钥的**单向加密备份** CLI：打包白名单 → zstd 
 - **白名单 + fail-safe 排除**：`monitors.lua`、`*.bak*`、缓存永不进包、永不被恢复
 - **不可变快照**：时间戳对象 + `latest` + `MANIFEST.json`（逐文件 sha256 + 插件清单）
 - **vault scan**：三层信号（名称/权限/内容特征）自动发现应加密的文件，人工确认后入库
-- **恢复包**：`kit export` 一个加密文件收走全部凭据（rclone / age 私钥 / 配置），换机只需「包 + 口令」两样
-- **一行恢复**：新机器 `curl … | bash -s -- --restore <恢复包>`，凭据回填 + 恢复全自动
+- **恢复包**：`kit export` 一个加密文件收走全部凭据（rclone / age 私钥 / 配置），自动托管云端恢复包库
+- **一行恢复**：新机器 `curl … | bash -s -- --restore`，授权 → 选包（备份时间/可恢复内容）→ 输口令 → 完成
 - **安全恢复**：pull 默认 dry-run 预览；覆盖前原文件改名 `.pre-restore-<时间>`；vault 文件强制 600
 - **可验证**：`verify` 定期完整解开核对 sha256，防备份静默腐烂
 - **双后端**：`rclone`（上云）/ `local`（本地目录，离线测试全链路）
@@ -35,7 +35,7 @@ curl -fsSL https://omarchy-backup.guoxudong.io | bash
 5. 首次备份两仓 + 完整校验
 6. 自动生成**恢复包**（换机一行恢复的钥匙）
 
-**唯一需要人做的两件事**：浏览器里授权一次 Cloudflare；保管好恢复包 + 恢复口令。
+**唯一需要人做的两件事**：浏览器里授权一次 Cloudflare；保管好恢复口令（恢复包自动托管云端）。
 其余全部自动。`setup --dry-run` 可先看计划；`setup --auto` 跳过交互提问。
 
 日常使用只有两条命令：改完配置 `omarchy-cfg-backup push`，出问题 `omarchy-cfg-backup pull`（dry-run 预览）。
@@ -72,44 +72,86 @@ omarchy-cfg-backup verify            # 下载 latest 完整校验一遍
 omarchy-cfg-backup vault scan        # 发现应加密的文件（只读）
 omarchy-cfg-backup vault push|pull|verify|status
 
-omarchy-cfg-backup kit export        # 导出恢复包（单文件+单口令，收走全部凭据）
-omarchy-cfg-backup restore <恢复包>   # 换机一行恢复（import → 预览 → 确认落盘）
+omarchy-cfg-backup kit export        # 生成加密恢复包并发布云端（新机免携带）
+omarchy-cfg-backup kit list          # 查看云端恢复包（备份时间/可恢复内容）
+omarchy-cfg-backup restore           # 换机恢复向导（授权 → 选包 → 输口令 → 落盘）
+omarchy-cfg-backup undo-restore      # 撤销恢复（dry-run 预览 → --yes 执行）
 ```
 
-## 换机恢复（新 Omarchy 一行命令）
+## 换机恢复（新 Omarchy 一行命令 · 免携带）
 
-**老机器**导出恢复包（`setup` 结束时已自动生成，可随时重新导出）：
+**老机器**只需正常备份：`kit export`（`setup` 会自动执行）会把加密恢复包
+**自动发布到云端恢复包库**（R2 `ocbkits/` 前缀，附明文清单：备份时间/可恢复内容）。
+
+**新机器**一行命令，全程只需两样东西：**浏览器里授权一次 Cloudflare + 恢复口令**：
 
 ```bash
-omarchy-cfg-backup kit export        # 输两次口令 → ~/ocb-recovery-<host>-<时间>.ocbkit
+curl -fsSL https://omarchy-backup.guoxudong.io | bash -s -- --restore
 ```
 
-换机只需要保管**两样东西**（不再需要逐条抄 9+ 个凭据）：
+向导流程（除标注外全自动）：
 
-| 保管物 | 放哪 | 说明 |
-|---|---|---|
-| 恢复包 `.ocbkit` | 网盘 / U 盘 / 密码管理器附件 | 内含 rclone 凭据、age 私钥、配置（含 HOST_TAG）、白名单 |
-| 恢复口令 | 密码管理器（**勿与包放一起**） | AES-256 + PBKDF2 加密；丢失即作废，建议 ≥12 位 |
+1. 缺失依赖自动安装（pacman；cf CLI 缺失时 npm 自动补装）
+2. **自动打开浏览器**完成 Cloudflare 授权
+3. 列出云端恢复包——每条展示**备份时间 · 主机 · 可恢复内容**（配置 N 项/密钥 M 项/age）：
 
-**新机器**一行命令：
+   ```
+   [1] 2026-09-29T20-40-38+0800 · omarchy · 配置 12 项 · 密钥 3 项 · age:开 · 24KB
+       可恢复内容: ~/.config/hypr/  ~/.config/omarchy/shell.json  ~/.bashrc …
+   ```
 
-```bash
-curl -fsSL https://omarchy-backup.guoxudong.io | bash -s -- --restore ~/ocb-recovery-xxx.ocbkit
-```
+4. **你选择**一个恢复包（编号）
+5. 输一次**恢复口令** → 回填 rclone 凭据 / age 私钥 / HOST_TAG → dry-run 预览 → 确认落盘
 
-自动完成：缺失依赖安装（pacman）→ CLI 安装 → 解开恢复包回填
-rclone 远端 / age 私钥 / HOST_TAG → 云端快照确认 → dry-run 预览 → 确认后
-cfg + vault 全部落盘（`--yes` 跳过确认，`--passphrase-file F` 供脚本化）。
 安全兜底不变：`monitors.lua` 永不覆盖、覆盖前改名 `.pre-restore-*`、vault 强制 600、**绝不 push**。
 
+其他形态：
+
 ```bash
-omarchy-cfg-backup restore <恢复包>   # 分步等价命令（交互确认）
-omarchy-cfg-backup kit import <恢复包>  # 只回填凭据与配置，不落盘配置文件
+omarchy-cfg-backup kit list           # 只看云端恢复包（不下载）
+omarchy-cfg-backup restore            # 不装 CLI，直接进云端向导
+omarchy-cfg-backup restore <恢复包>    # 离线/兜底：指定本地恢复包
+curl … | bash -s -- --restore ~/ocb-recovery-xxx.ocbkit   # 离线一行命令
 ```
 
+脚本化：`--select N`（选包）、`--yes`（跳过确认）、`--passphrase-file F`（口令）。
+恢复包仍可导出到本地（`kit export --output …`），口令丢失即包作废，建议 ≥12 位。
+
 恢复后手动两步：`hyprctl reload`、`omarchy restart shell`；各 agent 登录态
-重新登录即可（**预期行为，不是恢复失败**）。备份身份沿用包里的 `HOST_TAG`
-（一般是老机器 hostname）；想换新身份就改 `~/.config/omarchy-cfg-backup/config`。
+重新登录即可（**预期行为，不是恢复失败**）。
+
+**备份身份二选一**（恢复收尾会问）：老机器停用 → 沿用；与老机器并行共存 →
+改用新身份（`--new-identity` 可脚本化），此后 push 走独立前缀。
+
+## 冲突处理（多机同名 / 双写防护）
+
+| 冲突场景 | 防护机制 |
+|---|---|
+| 两台机器 hostname 相同 | `HOST_TAG` 默认带机器短 ID（`/etc/machine-id` 前 8 位）；老机器（有 state.json）平滑沿用历史身份，升级不换前缀 |
+| 异机双写同一备份前缀 | **push 前哨**：比对 latest MANIFEST 的 `machine_id`，不是本机即拦截；确认接管用 `push --force` |
+| 恢复机与老机器并行 | restore 收尾身份二选一（沿用 / 新身份） |
+| 文件覆盖 | dry-run 预览 + `.pre-restore-*` 改名保留 + `monitors.lua` 防火墙，零丢失 |
+
+旧快照 MANIFEST 无 `machine_id` 字段时不拦截（向后兼容）；自动同步被拦截时会大声失败并留待人工处理，绝不静默混写。
+
+## 撤销恢复（undo-restore）
+
+每次 `restore` / `pull --yes` 都会写**恢复日志**并保存恢复前状态，随时可反悔：
+
+- `~/.local/state/omarchy-cfg-backup/restore-journal-<时间>.json` —— 逐文件动作
+  （新增/覆盖）+ 内容指纹 + 备份身份前值
+- `pre-restore-<时间>.tar.zst` —— 覆盖前内容整体快照（tar 兜底）
+- 目录里的 `.pre-restore-*` —— 逐文件改名留底（原有机制）
+
+```bash
+omarchy-cfg-backup undo-restore              # dry-run 预览最近一次恢复的逆操作
+omarchy-cfg-backup undo-restore --yes        # 执行撤销
+omarchy-cfg-backup undo-restore <id> --yes   # 撤销指定某次恢复
+```
+
+撤销 = 删除恢复新增的文件 + 还原被覆盖的文件（`.pre-restore-*` 优先、缺失则 tar 快照兜底）
++ 还原备份身份（HOST_TAG）。安全兜底：**恢复后被你修改过的文件一律跳过**（先比对内容
+指纹），撤销本身默认 dry-run，重复撤销会被拒绝。
 
 ## 配置
 
@@ -207,8 +249,8 @@ vault 全链路与 600 权限、kit export/import 往返、错误口令拒绝、
 
 ## 安全须知
 
-- **恢复包 = 整套钥匙**（rclone 凭据 + age 私钥 + 配置）：放网盘/U 盘/密码管理器附件；
-  恢复口令单独放密码管理器，勿与包同处。口令丢失即作废，建议 ≥12 位
+- **恢复包 = 整套钥匙**（rclone 凭据 + age 私钥 + 配置）：云端托管的是口令加密后的密文
+  （R2 `ocbkits/`），拿到密文也需恢复口令才能解开；口令单独放密码管理器，丢失即作废，建议 ≥12 位
 - `rclone.conf` 同时含 R2 key 与 crypt 密码——务必 `chmod 600`，且 crypt 密码另存密码管理器 + 离线副本
 - vault 启用 `VAULT_USE_AGE=1` 后多一道独立口令保护；age 私钥（`AGE_IDENTITY`）同样需要异地保管
 - 各类 agent 的 OAuth 登录态会轮转：换机后重新登录是**预期行为**，不是恢复失败

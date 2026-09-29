@@ -145,6 +145,60 @@ assert "AGE_IDENTITY 重写为本机路径" grep -q "^AGE_IDENTITY=$T/cfg-x/age-
 assert "age identity 600" bash -c 'test "$(stat -c %a "$0")" = 600' "$T/cfg-x/age-identity.txt"
 assert "import 后白名单齐备" test -f "$T/cfg-x/include.txt"
 
+echo "== 冲突防护（HOST_TAG 防撞 + push 前哨）=="
+assert "MANIFEST 记录 machine_id" bash -c 'jq -e ".machine_id | length >= 8" "$0"' "$REMOTE_CFG_DIR/MANIFEST.json"
+D3="$T/tag-home"; mkdir -p "$D3/.config/ocb-tag"
+env -u HOST_TAG HOME="$D3" OCB_CONFIG_DIR="$D3/.config/ocb-tag" OCB_MACHINE_ID=cafebabe12 \
+  BACKEND=local LOCAL_ROOT="$T/remote" STATE_DIR="$D3/.local/state/ocb" \
+  "$CLI" doctor > "$T/tag1.log" 2>&1 || true
+assert "新机器默认 HOST_TAG 带机器短 ID" grep -qE 'HOST_TAG=[a-zA-Z0-9._-]+-cafebabe' "$T/tag1.log"
+mkdir -p "$D3/.local/state/ocb"; echo '{}' > "$D3/.local/state/ocb/state.json"
+env -u HOST_TAG HOME="$D3" OCB_CONFIG_DIR="$D3/.config/ocb-tag" OCB_MACHINE_ID=cafebabe12 \
+  BACKEND=local LOCAL_ROOT="$T/remote" STATE_DIR="$D3/.local/state/ocb" \
+  "$CLI" doctor > "$T/tag2.log" 2>&1 || true
+assert "老机器默认沿用历史身份（state.json 过渡）" grep -q "HOST_TAG=$(hostname)  KEEP_N" "$T/tag2.log"
+
+OCB_MACHINE_ID=deadbeef12 "$CLI" push --force > "$T/g1.log" 2>&1
+assert "异机 --force 可接管前缀" bash -c 'test "$(jq -r .machine_id "$0")" = deadbeef' "$REMOTE_CFG_DIR/MANIFEST.json"
+if OCB_MACHINE_ID=cafebabe12 "$CLI" push > "$T/g2.log" 2>&1; then
+  bad "跨机 push 被拦截"
+else
+  ok "跨机 push 被拦截"
+fi
+assert "拦截提示含异机信息" grep -q '另一台机器' "$T/g2.log"
+assert "--force 可放行接管" bash -c 'OCB_MACHINE_ID=cafebabe12 "$0" push --force' "$CLI"
+if OCB_MACHINE_ID=cafebabe12 "$CLI" vault push > "$T/g4.log" 2>&1; then
+  bad "vault 跨机 push 被拦截（age 路径）"
+else
+  ok "vault 跨机 push 被拦截（age 路径）"
+fi
+
+echo "== 撤销恢复（undo-restore）=="
+UT="$T/undo"
+mkdir -p "$UT/.config/hypr"
+echo 'bind = LOCAL-OLD' > "$UT/.config/hypr/bindings.lua"
+echo 'monitor = DP-U'   > "$UT/.config/hypr/monitors.lua"
+"$CLI" pull latest --yes --target "$UT" > "$T/u1.log" 2>&1
+assert "恢复落盘" cmp -s "$ROOT/.config/hypr/bindings.lua" "$UT/.config/hypr/bindings.lua"
+assert "恢复日志已生成" bash -c 'ls "$0"/restore-journal-*.json >/dev/null 2>&1' "$T/state"
+rm -f "$UT/.config/hypr/bindings.lua.pre-restore-"*
+echo 'alias USER-EDITED' > "$UT/.bashrc"
+assert "新增文件存在" test -f "$UT/.config/omarchy/shell.json"
+"$CLI" undo-restore > "$T/u2.log" 2>&1
+assert "undo 默认 dry-run 不动文件" cmp -s "$ROOT/.config/hypr/bindings.lua" "$UT/.config/hypr/bindings.lua"
+assert "undo dry-run 未删新增文件" test -f "$UT/.config/omarchy/shell.json"
+"$CLI" undo-restore --yes > "$T/u3.log" 2>&1
+assert "覆盖文件经 tar 兜底还原" bash -c 'test "$(cat "$0/.config/hypr/bindings.lua")" = "bind = LOCAL-OLD"' "$UT"
+assert "新增文件已删除" bash -c '! test -e "$0/.config/omarchy/shell.json"' "$UT"
+assert "用户修改的文件被跳过" bash -c 'test "$(cat "$0/.bashrc")" = "alias USER-EDITED"' "$UT"
+assert "undo 输出含跳过提示" grep -q '跳过' "$T/u3.log"
+assert "monitors.lua 始终未动" bash -c 'test "$(cat "$0/.config/hypr/monitors.lua")" = "monitor = DP-U"' "$UT"
+if "$CLI" undo-restore --yes > "$T/u4.log" 2>&1; then
+  bad "重复 undo 被拒绝"
+else
+  ok "重复 undo 被拒绝"
+fi
+
 echo "== 发布站点 =="
 assert "docs/index.html 与 bootstrap.sh 同步" cmp -s "$PROJ/bootstrap.sh" "$PROJ/docs/index.html"
 

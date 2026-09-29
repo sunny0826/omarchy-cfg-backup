@@ -14,12 +14,18 @@ tests/e2e.sh       # e2e 55 项（换机恢复三条真实旅程 + 负面用例�
 ```
 
 - 全部在临时目录 + 本地模拟 S3（`rclone serve s3`）中进行，不触碰真实家目录与云端
-- **E2E-1** 换机全流程（local + age vault）：对应 T4.6 核心路径、T4.1、T4.3、T4.4
+- **E2E-1** 换机全流程（local + age vault）：对应 T4.6 核心路径、T4.1、T4.3、T4.4；
+  含备份身份二选一（`--new-identity` 落 config）与 `undo-restore` 撤销身份切换
 - **E2E-2** 换机全流程（真实 rclone：serve s3 + crypt + age）：对应 T3.1、T3.5/T3.6 主链路
 - **E2E-3** bootstrap 一行命令安装 + `--restore` 恢复：对应 T1.2、T1.4；并用官方
   `omarchy plugin validate` 校验仓库根（plugin add 通道）与部署副本
 - **E2E-4** 负面用例：错误口令 / 篡改包 / 空云端 / 非交互未确认（对应 T5 思路）
-- test.sh 另覆盖 T2.2、T2.6、T3.2–T3.4、T4.1–T4.2、恢复包（kit export/import）往返
+- **E2E-5** 云端恢复包免携带恢复（stub cf + 模拟 R2）：发布 → 明文清单（备份时间/
+  可恢复内容）→ 自动 Cloudflare 授权 → 列表 → 选择 → 恢复；含缺 --select 拒绝、
+  恢复机双写老机前缀被前哨拦截、`--force` 接管
+- test.sh 另覆盖 T2.2、T2.6、T3.2–T3.4、T4.1–T4.2、恢复包（kit export/import）往返、
+  HOST_TAG 防撞默认值（新机短 ID / 老机过渡）、push 前哨（含 vault age 路径）、
+  undo-restore（tar 兜底还原 / 用户修改跳过 / dry-run / 重复拒绝）
 
 下表保留给**无法自动化的场景**：真机 UI（T6）、破坏性故障注入（T4.5、T5.1/T5.3）、
 timer 行为（T7）、全新 VM 的浏览器授权体验（T2.1/T2.5）。

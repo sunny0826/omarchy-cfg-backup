@@ -71,7 +71,7 @@ EOF
 chmod 600 "$A_CFG/config"
 
 run_a() { env HOME="$A_HOME" OCB_CONFIG_DIR="$A_CFG" "$CLI" "$@"; }
-run_b() { env HOME="$B_HOME" OCB_CONFIG_DIR="$B_CFG" "$CLI" "$@"; }
+run_b() { env OCB_MACHINE_ID=feedface HOME="$B_HOME" OCB_CONFIG_DIR="$B_CFG" "$CLI" "$@"; }
 
 if run_a push > "$T/a-push.log" 2>&1; then ok "机器A cfg push"; else bad "机器A cfg push"; cat "$T/a-push.log"; fi
 if run_a vault push > "$T/a-vpush.log" 2>&1; then ok "机器A vault push（age）"; else bad "机器A vault push"; cat "$T/a-vpush.log"; fi
@@ -111,6 +111,25 @@ assert "AGE_IDENTITY 重写为本机路径" grep -q "^AGE_IDENTITY=$B_CFG/age-id
 assert "age identity 600" bash -c 'test "$(stat -c %a "$0")" = 600' "$B_CFG/age-identity.txt"
 assert "机器B doctor 通过" run_b doctor
 assert "机器B list 看到快照（凭据/身份正确）" run_b list
+
+if run_b restore "$T/kit1.ocbkit" --passphrase-file "$T/pf1" --yes --new-identity > "$T/b-restore2.log" 2>&1; then
+  ok "restore --new-identity 成功"
+else
+  bad "restore --new-identity 成功"; tail -5 "$T/b-restore2.log"
+fi
+assert "新身份已写入 config（机器短 ID 后缀）" bash -c 'grep -qE "^HOST_TAG=.*-feedface$" "$0/config"' "$B_CFG"
+
+if run_b undo-restore --yes > "$T/b-undo.log" 2>&1; then
+  ok "undo-restore 撤销身份切换"
+else
+  bad "undo-restore 撤销身份切换"; tail -5 "$T/b-undo.log"
+fi
+assert "undo 还原备份身份" grep -q '^HOST_TAG=oldbox' "$B_CFG/config"
+if run_b undo-restore --yes > "$T/b-undo2.log" 2>&1; then
+  bad "重复 undo 被拒绝（e2e）"
+else
+  ok "重复 undo 被拒绝（e2e）"
+fi
 
 echo
 echo "== E2E-2 换机恢复（真实 rclone 路径: rclone serve s3 + crypt + age）=="
@@ -314,6 +333,185 @@ N4_HOME="$T/n4-home"; mkdir -p "$N4_HOME"
 assert_fail "非交互未确认被拒绝" env HOME="$N4_HOME" OCB_CONFIG_DIR="$N4_HOME/.config/omarchy-cfg-backup" \
   "$CLI" restore "$T/kit1.ocbkit" --passphrase-file "$T/pf1"
 assert "拒绝后未写入 .bashrc" bash -c '! test -e "$0/.bashrc"' "$N4_HOME"
+
+echo
+echo "== E2E-5 云端恢复包：免携带一键恢复（stub cf + 模拟 R2）=="
+STUB="$T/stubbin"
+mkdir -p "$STUB" "$T/cfstate" "$T/cfstate2"
+cat > "$STUB/cf" <<'CSTUB'
+#!/usr/bin/env bash
+set -u
+STATE="${CF_FAKE_STATE:-/tmp/cf-fake-state}"
+FROOT="${CF_FAKE_ROOT:-/tmp/cf-fake-root}"
+args=("$@")
+all="$*"
+case "$all" in
+  *"auth whoami"*)
+    [ -f "$STATE/authed" ] || exit 1
+    echo '{"accounts":[{"id":"fakeacct"}]}'
+    ;;
+  *"auth login"*)
+    mkdir -p "$STATE"; touch "$STATE/authed"; echo "opened browser"
+    ;;
+  *"r2 objects list"*)
+    bucket=""; prefix=""
+    for i in "${!args[@]}"; do
+      [ "${args[$i]}" = "--bucket-name" ] && bucket="${args[$((i+1))]}"
+      [ "${args[$i]}" = "--prefix" ] && prefix="${args[$((i+1))]}"
+    done
+    items='[]'
+    if [ -d "$FROOT/$bucket" ]; then
+      while IFS= read -r f; do
+        key="${f#"$FROOT/$bucket/"}"
+        if [ -n "$prefix" ]; then
+          case "$key" in "$prefix"*) : ;; *) continue ;; esac
+        fi
+        items=$(jq -c --arg k "$key" --argjson s "$(stat -c %s "$f")" '. + [{key:$k, size:$s}]' <<<"$items")
+      done < <(find "$FROOT/$bucket" -type f | sort)
+    fi
+    printf '%s\n' "$items"
+    ;;
+  *"r2 objects get"*)
+    bucket=""; key=""
+    for i in "${!args[@]}"; do
+      [ "${args[$i]}" = "get" ] && key="${args[$((i+1))]}"
+      [ "${args[$i]}" = "--bucket-name" ] && bucket="${args[$((i+1))]}"
+    done
+    [ -f "$FROOT/$bucket/$key" ] || exit 1
+    cat "$FROOT/$bucket/$key"
+    ;;
+  *)
+    echo "cf-stub: unsupported: $all" >&2
+    exit 1
+    ;;
+esac
+CSTUB
+chmod +x "$STUB/cf"
+assert "cf 桩就绪（登录→whoami）" bash -c 'CF_FAKE_STATE="$0" "$1" auth login --browser >/dev/null && CF_FAKE_STATE="$0" "$1" auth whoami >/dev/null' "$T/cfstate-stubtest" "$STUB/cf"
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+S5_PORT=$(free_port)
+mkdir -p "$T/s5root/omarchy-cfg-backup" "$T/s5root/omarchy-secret-vault"
+rclone serve s3 "$T/s5root" --addr "127.0.0.1:$S5_PORT" --auth-key "testkey,testsecret" \
+  --log-level ERROR > "$T/serve5.log" 2>&1 &
+SERVE_PID=$!
+for _ in $(seq 1 50); do
+  port_open "$S5_PORT" && break
+  sleep 0.1
+done
+assert "E2E-5 S3 服务就绪" port_open "$S5_PORT"
+
+A5_HOME="$T/a5-home"; A5_CFG="$A5_HOME/.config/omarchy-cfg-backup"
+B5_HOME="$T/b5-home"; B5_CFG="$B5_HOME/.config/omarchy-cfg-backup"
+mkdir -p "$A5_CFG" "$A5_HOME/.config/rclone"
+write_fixture "$A5_HOME"
+write_includes "$A5_CFG"
+PUB5=$(make_age "$A5_CFG")
+cat > "$A5_CFG/config" <<EOF
+BACKEND=rclone
+REMOTE_CFG=r2-crypt
+REMOTE_VAULT=r2-vault-crypt
+HOST_TAG=oldbox
+KEEP_N=5
+VAULT_USE_AGE=1
+AGE_RECIPIENT=$PUB5
+AGE_IDENTITY=$A5_CFG/age-identity.txt
+EOF
+chmod 600 "$A5_CFG/config"
+PWC=$(rclone obscure 'e5-cfg'); PWC2=$(rclone obscure 'e5-cfg2')
+PWV=$(rclone obscure 'e5-vault'); PWV2=$(rclone obscure 'e5-vault2')
+cat > "$A5_HOME/.config/rclone/rclone.conf" <<EOF
+[r2]
+type = s3
+provider = Other
+access_key_id = testkey
+secret_access_key = testsecret
+endpoint = http://127.0.0.1:$S5_PORT
+no_check_bucket = true
+
+[r2-vault]
+type = s3
+provider = Other
+access_key_id = testkey
+secret_access_key = testsecret
+endpoint = http://127.0.0.1:$S5_PORT
+no_check_bucket = true
+
+[r2-crypt]
+type = crypt
+remote = r2:omarchy-cfg-backup
+password = $PWC
+password2 = $PWC2
+
+[r2-vault-crypt]
+type = crypt
+remote = r2-vault:omarchy-secret-vault
+password = $PWV
+password2 = $PWV2
+EOF
+chmod 600 "$A5_HOME/.config/rclone/rclone.conf"
+
+run_a5() { env OCB_MACHINE_ID=aaaa1111 HOME="$A5_HOME" OCB_CONFIG_DIR="$A5_CFG" RCLONE_CONFIG="$A5_HOME/.config/rclone/rclone.conf" "$CLI" "$@"; }
+run_b5() { env OCB_MACHINE_ID=bbbb2222 PATH="$STUB:$PATH" CF_FAKE_ROOT="$T/s5root" CF_FAKE_STATE="$T/cfstate" \
+  HOME="$B5_HOME" OCB_CONFIG_DIR="$B5_CFG" RCLONE_CONFIG="$B5_HOME/.config/rclone/rclone.conf" "$CLI" "$@"; }
+
+if run_a5 push > "$T/a5-push.log" 2>&1 && run_a5 vault push > "$T/a5-vpush.log" 2>&1; then
+  ok "机器A5 备份两仓（S3+crypt+age）"
+else
+  bad "机器A5 备份两仓"; tail -5 "$T/a5-push.log" "$T/a5-vpush.log"
+fi
+printf 'e5-kit-passphrase' > "$T/pf5"; chmod 600 "$T/pf5"
+if run_a5 kit export --passphrase-file "$T/pf5" --output "$T/kit5.ocbkit" > "$T/kit5.log" 2>&1; then
+  ok "kit export 成功（发布云端）"
+else
+  bad "kit export 成功（发布云端）"; cat "$T/kit5.log"
+fi
+K5DIR="$T/s5root/omarchy-cfg-backup/ocbkits/oldbox"
+assert "恢复包已发布到云端" test -f "$K5DIR/kit5.ocbkit"
+assert "明文清单已发布" test -f "$K5DIR/kit5.meta.json"
+assert "清单含备份时间" jq -e '.created | test("^[0-9]{4}-")' "$K5DIR/kit5.meta.json"
+assert "清单含可恢复配置" jq -e '.cfg.count > 0 and (.cfg.entries | length) > 0' "$K5DIR/kit5.meta.json"
+assert "清单含可恢复密钥" jq -e '.vault.count > 0' "$K5DIR/kit5.meta.json"
+
+env PATH="$STUB:$PATH" CF_FAKE_ROOT="$T/s5root" CF_FAKE_STATE="$T/cfstate2" \
+  HOME="$B5_HOME" OCB_CONFIG_DIR="$B5_CFG" RCLONE_CONFIG="$B5_HOME/.config/rclone/rclone.conf" \
+  "$CLI" kit list > "$T/b5-list.log" 2>&1 || true
+assert "kit list 展示备份时间" grep -qE '[0-9]{4}-[0-9]{2}-[0-9]{2}' "$T/b5-list.log"
+assert "kit list 展示主机与项数" grep -q 'oldbox · 配置' "$T/b5-list.log"
+assert "kit list 展示可恢复内容" grep -q '可恢复内容' "$T/b5-list.log"
+
+mkdir -p "$B5_HOME/.config/hypr"
+echo 'monitor = DP-B' > "$B5_HOME/.config/hypr/monitors.lua"
+if run_b5 restore --select 1 --yes --passphrase-file "$T/pf5" > "$T/b5-restore.log" 2>&1; then
+  ok "云端向导一行恢复成功（授权→列表→选择→恢复）"
+else
+  bad "云端向导一行恢复成功（授权→列表→选择→恢复）"; cat "$T/b5-restore.log"
+fi
+assert "自动完成 Cloudflare 授权（打开浏览器流程）" test -f "$T/cfstate/authed"
+assert "向导展示备份时间" grep -qE '[0-9]{4}-[0-9]{2}-[0-9]{2}' "$T/b5-restore.log"
+assert "向导展示可恢复内容" grep -q '可恢复内容' "$T/b5-restore.log"
+assert "恢复 .bashrc 一致" cmp -s "$A5_HOME/.bashrc" "$B5_HOME/.bashrc"
+assert "vault 恢复且 600" bash -c 'test "$(stat -c %a "$0/.config/gh/hosts.yml")" = 600' "$B5_HOME"
+assert "monitors.lua 防火墙仍然生效" bash -c 'test "$(cat "$0")" = "monitor = DP-B"' "$B5_HOME/.config/hypr/monitors.lua"
+
+if run_b5 push > "$T/b5-push.log" 2>&1; then
+  bad "恢复机双写老机前缀被拦截"
+else
+  ok "恢复机双写老机前缀被拦截"
+fi
+assert "前哨提示另一台机器" grep -q '另一台机器' "$T/b5-push.log"
+if run_b5 push --force > "$T/b5-push2.log" 2>&1; then
+  ok "恢复机 --force 可接管前缀"
+else
+  bad "恢复机 --force 可接管前缀"; tail -5 "$T/b5-push2.log"
+fi
+
+B6_HOME="$T/b6-home"; mkdir -p "$B6_HOME"
+assert_fail "云端模式缺 --select 被拒绝" env PATH="$STUB:$PATH" CF_FAKE_ROOT="$T/s5root" CF_FAKE_STATE="$T/cfstate2" \
+  HOME="$B6_HOME" OCB_CONFIG_DIR="$B6_HOME/.config/omarchy-cfg-backup" \
+  RCLONE_CONFIG="$B6_HOME/.config/rclone/rclone.conf" "$CLI" restore --yes --passphrase-file "$T/pf5"
+
+kill "$SERVE_PID" 2>/dev/null; SERVE_PID=""
 
 echo
 echo "e2e 结果: $pass 通过 · $fail 失败"

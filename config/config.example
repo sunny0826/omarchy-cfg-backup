@@ -17,6 +17,9 @@ REMOTE_VAULT=r2-vault-crypt
 # 每仓保留的时间戳快照数量
 KEEP_N=10
 
+# 云端恢复包所在 bucket（ocbkits/ 前缀：kit export 发布 / restore 云端向导发现）
+# KIT_BUCKET=omarchy-cfg-backup
+
 # vault 的 age 内层加密（推荐启用；需要 age-keygen 生成的密钥对）
 # 加密用公钥，解密用私钥文件；私钥必须同时存密码管理器/离线副本
 VAULT_USE_AGE=0

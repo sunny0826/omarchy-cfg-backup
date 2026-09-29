@@ -23,7 +23,7 @@ usage() {
                                     首次备份+校验。幂等，可重复执行。
 
 配置备份（A 类 · 普通配置）:
-  push [--dry-run]              打包白名单 → 压缩 → 上传时间戳快照 + latest + MANIFEST
+  push [--dry-run] [--force]     打包白名单 → 压缩 → 上传时间戳快照 + latest + MANIFEST
   list                          列出该主机的云端快照
   pull [id|latest] [--yes] [--target DIR]
                                 下载解包到临时目录 → dry-run 覆盖预览；--yes 才真正落盘
@@ -34,13 +34,19 @@ usage() {
   vault scan [--emit-include F] 只读扫描应加密文件（三层信号分级 + 权限告警）
   vault push|list|pull|verify|status   同上，走独立远端 + 可选 age 层
 
-换机迁移（恢复包 · 单文件 + 单口令携带全部凭据）:
-  kit export [--output FILE] [--passphrase-file F]
-                                打包 rclone 凭据 + age 私钥 + 配置 → 一个加密恢复包
+换机迁移（恢复包托管云端 · 新机免携带）:
+  kit export [--output FILE] [--passphrase-file F] [--no-publish]
+                                生成加密恢复包并发布到云端 ocbkits/（附明文清单：备份时间/内容）
+  kit list                      列出云端恢复包（备份时间 · 主机 · 可恢复内容）
   kit import <kit> [--passphrase-file F]
                                 解开恢复包，回填本机凭据与配置（rclone 远端安全合并）
-  restore <kit> [--yes] [--passphrase-file F] [--target DIR]
-                                一行恢复: import → 预览 → 确认 → cfg+vault 全部落盘
+  restore [<kit>] [--select N] [--yes] [--passphrase-file F] [--target DIR]
+                                无参数=云端向导：Cloudflare 授权（自动开浏览器）→ 列出
+                                恢复包（备份时间/可恢复内容）→ 选择 → 预览 → 确认落盘
+                                指定文件=离线恢复
+  undo-restore [id] [--yes]     撤销恢复（默认 dry-run 预览）：删除恢复新增的文件、
+                                还原被覆盖的文件、还原备份身份；被用户修改过的文件跳过。
+                                材料=恢复日志 .pre-restore-* + pre-restore tar 快照兜底
 
 其他:
   widget-status                 状态栏组件数据源（单行 JSON，无网络）
@@ -55,11 +61,41 @@ usage() {
   --target DIR   恢复到指定目录（默认 $ROOT，即家目录）
   --dry-run      push 时只打包不上传
   --no-age       vault push 临时跳过 age 层
+  --force        push 跳过跨机双写拦截（接管该备份前缀）
+  --new-identity restore 后改用新备份身份（HOST_TAG=hostname-机器短ID）
 
 安全默认: monitors.lua / *.bak* / 缓存永不进包；pull 永不覆盖 monitors.lua；
 覆盖前原文件改名为 .pre-restore-<时间>；vault 文件落盘后强制 chmod 600。
 恢复包为单个加密文件（AES-256 + PBKDF2），口令与包分离保管，换机仅需两样。
+冲突防护: HOST_TAG 默认带机器短 ID 防同名互撞；异机双写同一前缀会被 push 前哨拦截。
 EOF
+}
+
+# ---------------- 主机标识（防撞：机器短 ID） ----------------
+_machine_short_id() {
+  if [ -n "${OCB_MACHINE_ID:-}" ]; then
+    printf '%s' "${OCB_MACHINE_ID:0:8}"
+    return 0
+  fi
+  local mid=""
+  [ -f /etc/machine-id ] && mid=$(tr -d '[:space:]' < /etc/machine-id 2>/dev/null)
+  if [ -z "$mid" ]; then
+    mid=$(printf '%s' "$(hostname)" | sha256sum | cut -c1-8)
+  fi
+  printf '%s' "${mid:0:8}"
+}
+
+_default_host_tag() { printf '%s-%s' "$(hostname)" "$(_machine_short_id)"; }
+
+_set_host_tag() { # 新身份写入 config（显式钉住）并重载
+  local f="$CONFIG_DIR/config" v=$1
+  if grep -q '^HOST_TAG=' "$f" 2>/dev/null; then
+    sed -i "s|^HOST_TAG=.*|HOST_TAG=$v|" "$f"
+  else
+    printf '\nHOST_TAG=%s\n' "$v" >> "$f"
+  fi
+  chmod 600 "$f"
+  reload_config
 }
 
 # ---------------- 配置 ----------------
@@ -73,7 +109,15 @@ _load_config() {
   : "${REMOTE_CFG:=r2-crypt}"                  # rclone 远端（含 bucket）
   : "${REMOTE_VAULT:=r2-vault-crypt}"
   : "${LOCAL_ROOT:=$HOME/.local/share/omarchy-cfg-backup/remote}"  # BACKEND=local 时
-  : "${HOST_TAG:=$(hostname)}"
+  : "${STATE_DIR:=$HOME/.local/state/omarchy-cfg-backup}"   # 本地状态（供状态栏组件读取）
+  if [ -z "${HOST_TAG:-}" ]; then
+    # 老机器（已有备份状态）沿用历史身份 hostname；新机器带机器短 ID，避免默认同名互撞
+    if [ -f "$STATE_DIR/state.json" ]; then
+      HOST_TAG="$(hostname)"
+    else
+      HOST_TAG="$(_default_host_tag)"
+    fi
+  fi
   : "${KEEP_N:=10}"
   : "${VAULT_USE_AGE:=0}"
   : "${AGE_RECIPIENT:=}"                       # age1... 公钥（加密）
@@ -81,14 +125,14 @@ _load_config() {
   : "${ROOT:=$HOME}"                           # 打包/恢复的根（测试可覆写）
   : "${INCLUDE_FILE:=$CONFIG_DIR/include.txt}"
   : "${VAULT_INCLUDE_FILE:=$CONFIG_DIR/vault-include.txt}"
-  : "${STATE_DIR:=$HOME/.local/state/omarchy-cfg-backup}"   # 本地状态（供状态栏组件读取）
+  : "${KIT_BUCKET:=omarchy-cfg-backup}"        # 云端恢复包所在 bucket（ocbkits/ 前缀）
 }
 _load_config
 
 # kit import 后重新载入配置（清掉旧值，避免新旧配置混血）
 reload_config() {
   unset BACKEND REMOTE_CFG REMOTE_VAULT LOCAL_ROOT HOST_TAG KEEP_N \
-        VAULT_USE_AGE AGE_RECIPIENT AGE_IDENTITY ROOT INCLUDE_FILE VAULT_INCLUDE_FILE STATE_DIR
+        VAULT_USE_AGE AGE_RECIPIENT AGE_IDENTITY ROOT INCLUDE_FILE VAULT_INCLUDE_FILE STATE_DIR KIT_BUCKET
   _load_config
 }
 
@@ -102,6 +146,7 @@ cleanup() {
   if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
   if [ -n "$SCAN_TMP" ]; then rm -rf "$SCAN_TMP"; fi
   if [ -n "$PASS_TMP" ]; then rm -f "$PASS_TMP"; fi
+  if [ -n "${DL_KIT:-}" ]; then rm -f "$DL_KIT"; fi
   return "$rc"
 }
 trap cleanup EXIT
@@ -211,9 +256,10 @@ _build_manifest() { # kind filelist → stdout JSON
     printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$sha" "$size" "$mode" "$mt" >> "$entries"
   done < "$list"
   jq -Rn \
-    --arg created "$TS" --arg host "$HOST_TAG" --arg kind "$kind" --arg snap "$TS$SUF" --arg ver "$VERSION" '
+    --arg created "$TS" --arg host "$HOST_TAG" --arg kind "$kind" --arg snap "$TS$SUF" --arg ver "$VERSION" \
+    --arg mid "$(_machine_short_id)" '
     [inputs | split("\t") | {path:.[0], sha256:.[1], size:(.[2]|tonumber), mode:.[3], mtime:.[4]}] as $f
-    | {created:$created, hostname:$host, kind:$kind, snapshot:$snap, tool:$ver, file_count:($f|length), files:$f}' < "$entries"
+    | {created:$created, hostname:$host, machine_id:$mid, kind:$kind, snapshot:$snap, tool:$ver, file_count:($f|length), files:$f}' < "$entries"
 }
 
 # 插件清单（方案要求：只记 id + git URL，不备份源码树）
@@ -232,13 +278,58 @@ _attach_plugins() { # kind manifestfile
 }
 
 # ---------------- push ----------------
+_fetch_manifest() { # kind → stdout 本地 MANIFEST 路径（无/解不开则空）
+  local kind=$1 ageext="" tmp mf
+  [ "$VAULT_USE_AGE" = 1 ] && [ "$kind" = vault ] && ageext=".age"
+  tmp=$(mktemp)
+  if ! (_remote_get "$kind" "omarchy/$HOST_TAG/MANIFEST.json$ageext" "$tmp") >/dev/null 2>&1; then
+    rm -f "$tmp"
+    return 0
+  fi
+  mf="$tmp"
+  if [ -n "$ageext" ]; then
+    if ! age -d -i "$AGE_IDENTITY" -o "$tmp.dec" "$tmp" >/dev/null 2>&1; then
+      rm -f "$tmp"
+      return 0
+    fi
+    mf="$tmp.dec"
+    rm -f "$tmp"
+  fi
+  printf '%s' "$mf"
+}
+
+_guard_prefix_owner() { # kind force(0|1) —— 同前缀异机双写检测（push 前哨）
+  local mf owner mid force="${2:-0}" ans=""
+  mf=$(_fetch_manifest "$1")
+  [ -n "$mf" ] && [ -f "$mf" ] || return 0
+  owner=$(jq -r '.machine_id // empty' "$mf" 2>/dev/null || true)
+  rm -f "$mf"
+  [ -n "$owner" ] || return 0
+  mid=$(_machine_short_id)
+  [ "$owner" = "$mid" ] && return 0
+  warn "备份前缀 omarchy/$HOST_TAG/ 的最近快照来自另一台机器（machine_id=$owner ≠ 本机 $mid）"
+  if [ "$force" = 1 ]; then
+    note "--force：接管该前缀继续上传"
+    return 0
+  fi
+  if [ -t 0 ]; then
+    read -r -p "继续与另一台机器双写同一前缀？（不建议）[y/N] " ans || ans=""
+    case "$ans" in
+      y|Y) return 0 ;;
+    esac
+    die "已中止。建议在 config 设 HOST_TAG=<新名字> 分离身份；确认接管则用 push --force"
+  fi
+  die "已中止（非交互）。建议在 config 设 HOST_TAG=<新名字> 分离身份；确认接管则用 push --force"
+}
+
 do_push() { # kind [flags...]
   local kind=$1; shift
-  local dry=0 use_age="$VAULT_USE_AGE"
+  local dry=0 use_age="$VAULT_USE_AGE" force=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run) dry=1; shift ;;
       --no-age) use_age=0; shift ;;
+      --force) force=1; shift ;;
       *) die "push: 未知选项 $1" ;;
     esac
   done
@@ -286,6 +377,7 @@ do_push() { # kind [flags...]
   fi
 
   _remote_reachable "$kind" || die "远端不可达: $(_remote_name "$kind")（BACKEND=$BACKEND）"
+  _guard_prefix_owner "$kind" "$force"
   step "上传快照 + latest + MANIFEST"
   _remote_put "$kind" "$up" "omarchy/$HOST_TAG/$snap$ageext"
   _remote_put "$kind" "$up" "omarchy/$HOST_TAG/latest$SUF$ageext"
@@ -328,6 +420,196 @@ _fetch_latest() { # kind → 设置 DL_SNAP(本地解密后 tar 路径) DL_MANIF
     age -d -i "$AGE_IDENTITY" -o "$DL_MANIFEST" "$WORK/MANIFEST.json$ageext"
   fi
   zstd -tq "$DL_SNAP"
+}
+
+# ---------------- 恢复日志与撤销（journal / undo-restore） ----------------
+JOURNAL_ID=""
+JOURNAL_OWNER=""
+JOURNAL_TMP=""
+JOURNAL_STAGE=""
+JOURNAL_META=""
+
+_journal_begin() { # owner —— 幂等，首个会话者持有（restore/pull/import）
+  [ -n "$JOURNAL_ID" ] && return 0
+  JOURNAL_OWNER=$1
+  JOURNAL_ID="$TS-$"
+  JOURNAL_TMP=$(mktemp)
+  JOURNAL_META=$(mktemp)
+  JOURNAL_STAGE=$(mktemp -d)
+  : > "$JOURNAL_TMP"
+  : > "$JOURNAL_META"
+}
+
+_journal_action() { # path kind backup written_sha [tar_member]
+  [ -n "$JOURNAL_ID" ] || return 0
+  jq -cn --arg path "$1" --arg kind "$2" --arg backup "$3" --arg sha "$4" --arg tar "${5:-}" \
+    '{path:$path, kind:$kind, backup:$backup, written_sha256:$sha, tar_member:$tar}' >> "$JOURNAL_TMP"
+}
+
+_journal_host_tag() { # before after
+  [ -n "$JOURNAL_ID" ] || return 0
+  jq -cn --arg before "$1" --arg after "$2" \
+    '{action:"host-tag", before:$before, after:$after}' >> "$JOURNAL_META"
+}
+
+_journal_stage_backup() { # rel src —— 覆盖前内容入暂存（tar 快照兜底材料）
+  [ -n "$JOURNAL_ID" ] || return 0
+  mkdir -p "$JOURNAL_STAGE/$(dirname "$1")"
+  cp -a "$2" "$JOURNAL_STAGE/$1"
+}
+
+_journal_commit_if() { # owner —— 会话归属匹配才落盘
+  [ -n "$JOURNAL_ID" ] || return 0
+  [ "$JOURNAL_OWNER" = "$1" ] || return 0
+  local n tarfile="" actions tags
+  n=$(wc -l < "$JOURNAL_TMP")
+  if [ "$n" -eq 0 ] && [ ! -s "$JOURNAL_META" ]; then
+    rm -f "$JOURNAL_TMP" "$JOURNAL_META"
+    rm -rf "$JOURNAL_STAGE"
+    JOURNAL_ID=""; JOURNAL_OWNER=""; JOURNAL_TMP=""; JOURNAL_STAGE=""; JOURNAL_META=""
+    return 0
+  fi
+  mkdir -p "$STATE_DIR"
+  if [ -n "$(find "$JOURNAL_STAGE" -type f -print -quit 2>/dev/null)" ]; then
+    tarfile="$STATE_DIR/pre-restore-$JOURNAL_ID.tar.zst"
+    tar -C "$JOURNAL_STAGE" --zstd -cf "$tarfile" .
+  fi
+  actions=$(jq -s '.' "$JOURNAL_TMP")
+  tags=$(jq -s '.' "$JOURNAL_META")
+  jq -n --arg id "$JOURNAL_ID" --arg created "$TS" --argjson actions "$actions" \
+        --argjson tags "$tags" --arg tarfile "$tarfile" \
+    '{schema:1, kind:"ocb-restore-journal", id:$id, created:$created, undone:false,
+      tarball:$tarfile, host_tag_changes:$tags, actions:$actions}' \
+    > "$STATE_DIR/restore-journal-$JOURNAL_ID.json"
+  info "恢复日志: restore-journal-$JOURNAL_ID.json（undo-restore 可撤销本次恢复）"
+  rm -f "$JOURNAL_TMP" "$JOURNAL_META"
+  rm -rf "$JOURNAL_STAGE"
+  JOURNAL_ID=""; JOURNAL_OWNER=""; JOURNAL_TMP=""; JOURNAL_STAGE=""; JOURNAL_META=""
+}
+
+do_undo_restore() { # [id] [--yes]
+  local id="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      -*) die "undo-restore: 未知选项 $1" ;;
+      *) [ -z "$id" ] || die "undo-restore: 只接受一个 id"; id=$1; shift ;;
+    esac
+  done
+  need jq "pacman -S jq"; need tar "coreutils"; need zstd "pacman -S zstd"
+  local jf
+  if [ -n "$id" ]; then
+    jf="$STATE_DIR/restore-journal-$id.json"
+  else
+    jf=$(ls "$STATE_DIR"/restore-journal-*.json 2>/dev/null | sort | tail -1 || true)
+  fi
+  [ -n "$jf" ] && [ -f "$jf" ] || die "找不到恢复日志（$STATE_DIR/restore-journal-*.json）"
+  jq -e '.undone != true' "$jf" >/dev/null 2>&1 || die "该恢复已撤销过: $(jq -r '.id' "$jf")"
+  local tarfile
+  tarfile=$(jq -r '.tarball // ""' "$jf")
+
+  step "撤销恢复 $(jq -r '.id' "$jf")（$(jq -r '.created' "$jf")）"
+  WORK=$(mktemp -d)
+  [ -n "$tarfile" ] && [ -f "$tarfile" ] && { mkdir -p "$WORK/undo"; tar -C "$WORK/undo" --zstd -xf "$tarfile"; }
+
+  local row path kind backup wsha tmember cur ok_add ok_over
+  ok_add=0; ok_over=0
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    path=$(jq -r '.path' <<<"$row")
+    kind=$(jq -r '.kind' <<<"$row")
+    backup=$(jq -r '.backup // ""' <<<"$row")
+    wsha=$(jq -r '.written_sha256 // ""' <<<"$row")
+    tmember=$(jq -r '.tar_member // ""' <<<"$row")
+    case "$kind" in
+      add)
+        if [ ! -e "$path" ]; then
+          printf '  %-28s %s\n' "已不存在" "$path"
+        elif [ -n "$wsha" ] && [ "$(sha256sum "$path" | cut -d' ' -f1)" != "$wsha" ]; then
+          printf '  %-28s %s\n' "跳过（已被修改）" "$path"
+        else
+          printf '  %-28s %s\n' "删除（恢复时新增）" "$path"
+          ok_add=$((ok_add + 1))
+        fi
+        ;;
+      overwrite)
+        if [ -n "$backup" ] && [ -f "$backup" ]; then
+          cur="备份: $(basename "$backup")"
+        elif [ -n "$tmember" ] && [ -f "$WORK/undo/$tmember" ]; then
+          cur="tar 快照兜底"
+        else
+          printf '  %-28s %s\n' "跳过（无备份可还原）" "$path"
+          continue
+        fi
+        if [ -e "$path" ] && [ -n "$wsha" ] && [ "$(sha256sum "$path" | cut -d' ' -f1)" != "$wsha" ]; then
+          printf '  %-28s %s\n' "跳过（已被修改）" "$path"
+        else
+          printf '  %-28s %s（%s）\n' "还原（覆盖前内容）" "$path" "$cur"
+          ok_over=$((ok_over + 1))
+        fi
+        ;;
+    esac
+  done < <(jq -c '.actions | reverse | .[]' "$jf")
+
+  local tagb taga
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    tagb=$(jq -r '.before' <<<"$row")
+    taga=$(jq -r '.after' <<<"$row")
+    printf '  %-28s HOST_TAG: %s → %s\n' "还原备份身份" "$taga" "$tagb"
+  done < <(jq -c '.host_tag_changes[]?' "$jf")
+
+  if [ "$yes" != 1 ]; then
+    echo
+    info "dry-run 结束（未做任何修改）。确认无误后加 --yes 执行撤销。"
+    return 0
+  fi
+
+  step "执行撤销（删除 $ok_add · 还原 $ok_over）"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    path=$(jq -r '.path' <<<"$row")
+    kind=$(jq -r '.kind' <<<"$row")
+    backup=$(jq -r '.backup // ""' <<<"$row")
+    wsha=$(jq -r '.written_sha256 // ""' <<<"$row")
+    tmember=$(jq -r '.tar_member // ""' <<<"$row")
+    case "$kind" in
+      add)
+        if [ ! -e "$path" ]; then continue; fi
+        if [ -n "$wsha" ] && [ "$(sha256sum "$path" | cut -d' ' -f1)" != "$wsha" ]; then continue; fi
+        rm -f "$path"
+        note "已删除: $path"
+        ;;
+      overwrite)
+        if [ -n "$backup" ] && [ -f "$backup" ]; then
+          if [ -e "$path" ] && [ -n "$wsha" ] && [ "$(sha256sum "$path" | cut -d' ' -f1)" != "$wsha" ]; then continue; fi
+          mv -f "$backup" "$path"
+          note "已还原: $path"
+        elif [ -n "$tmember" ] && [ -f "$WORK/undo/$tmember" ]; then
+          if [ -e "$path" ] && [ -n "$wsha" ] && [ "$(sha256sum "$path" | cut -d' ' -f1)" != "$wsha" ]; then continue; fi
+          mkdir -p "$(dirname "$path")"
+          cp -a "$WORK/undo/$tmember" "$path"
+          note "已还原（tar 兜底）: $path"
+        fi
+        ;;
+    esac
+  done < <(jq -c '.actions | reverse | .[]' "$jf")
+
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    tagb=$(jq -r '.before' <<<"$row")
+    if [ -f "$CONFIG_DIR/config" ]; then
+      if grep -q '^HOST_TAG=' "$CONFIG_DIR/config"; then
+        sed -i "s|^HOST_TAG=.*|HOST_TAG=$tagb|" "$CONFIG_DIR/config"
+      fi
+    fi
+    note "HOST_TAG 已还原: $tagb"
+  done < <(jq -c '.host_tag_changes[]?' "$jf")
+
+  jq '.undone = true' "$jf" > "$jf.new" && mv "$jf.new" "$jf"
+  rm -rf "$WORK"; WORK=""
+  info "撤销完成"
+  note "如需再次恢复: omarchy-cfg-backup restore 或 pull"
 }
 
 # ---------------- pull ----------------
@@ -397,17 +679,27 @@ do_pull() { # kind [id] [--yes] [--target DIR]
   fi
 
   step "执行恢复"
-  local rel2
+  _journal_begin pull
+  local rel2 wsha
   for rel2 in "${plan[@]}"; do
     tgt="$target/$rel2"
     mkdir -p "$(dirname "$tgt")"
     if [ -e "$tgt" ]; then
+      _journal_stage_backup "$rel2" "$tgt"
       mv "$tgt" "$tgt.pre-restore-$TS"
       note "原文件改名: $rel2.pre-restore-$TS"
+      cp -a "$WORK/x/$rel2" "$tgt"
+      [ "$kind" = vault ] && chmod 600 "$tgt"
+      wsha=$(sha256sum "$tgt" | cut -d' ' -f1)
+      _journal_action "$tgt" overwrite "$tgt.pre-restore-$TS" "$wsha" "$rel2"
+    else
+      cp -a "$WORK/x/$rel2" "$tgt"
+      [ "$kind" = vault ] && chmod 600 "$tgt"
+      wsha=$(sha256sum "$tgt" | cut -d' ' -f1)
+      _journal_action "$tgt" add "" "$wsha" ""
     fi
-    cp -a "$WORK/x/$rel2" "$tgt"
-    [ "$kind" = vault ] && chmod 600 "$tgt"
   done
+  _journal_commit_if pull
   info "恢复完成: ${#plan[@]} 个文件 → $target"
   note "后续: hyprctl reload / omarchy restart shell（手动执行）"
 }
@@ -800,6 +1092,9 @@ _rclone_merge() { # kitconf targetconf：kit 中的远端块合并进目标 rclo
   mkdir -p "$(dirname "$target")"
   mv "$work/merged" "$target"
   chmod 600 "$target"
+  if [ -n "$bak" ]; then
+    _journal_action "$target" overwrite "$bak" "$(sha256sum "$target" | cut -d' ' -f1)" ""
+  fi
   rm -rf "$work"
 }
 
@@ -820,11 +1115,12 @@ _kit_write_config() { # 输出到 $1：从当前有效状态生成完整 config�
 }
 
 do_kit_export() {
-  local out="" pf=""
+  local out="" pf="" publish=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --output) [ $# -ge 2 ] || die "kit export: --output 缺参数"; out=$2; shift 2 ;;
       --passphrase-file) [ $# -ge 2 ] || die "kit export: --passphrase-file 缺参数"; pf=$2; shift 2 ;;
+      --no-publish) publish=0; shift ;;
       *) die "kit export: 未知选项 $1" ;;
     esac
   done
@@ -883,9 +1179,19 @@ do_kit_export() {
   openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -salt \
     -pass "file:$PASS_TMP" -in "$WORK/kit.tar.zst" >> "$out"
   chmod 600 "$out"
+  _kit_write_meta "$WORK/kit.meta.json" "$out"
+  local published=0
+  if [ "$publish" = 1 ]; then
+    _kit_publish "$out" "$WORK/kit.meta.json" && published=1
+  fi
   rm -rf "$WORK"; WORK=""
   info "恢复包已生成: $out（$(stat -c %s "$out") 字节）"
-  note "换机只需两样: ① 这个文件 ② 恢复口令（进密码管理器，勿与包放一起）"
+  if [ "$published" = 1 ]; then
+    note "已发布到云端恢复包库；新机器一行命令即可恢复，无需携带文件："
+    note "  curl -fsSL https://omarchy-backup.guoxudong.io | bash -s -- --restore"
+  else
+    note "换机需携带: ① 这个文件 ② 恢复口令（进密码管理器，勿与包放一起）"
+  fi
   note "内含: rclone 凭据 · age 私钥 · 配置（HOST_TAG=$HOST_TAG）· 白名单"
 }
 
@@ -929,16 +1235,24 @@ do_kit_import() {
 
   step "回填凭据与配置 → $CONFIG_DIR"
   mkdir -p "$CONFIG_DIR"
-  local tgt
+  _journal_begin import
+  local tgt wsha
   for f in config include.txt vault-include.txt age-identity.txt; do
     [ -f "$WORK/x/$f" ] || continue
     tgt="$CONFIG_DIR/$f"
     if [ -e "$tgt" ]; then
       cp -a "$tgt" "$tgt.pre-restore-$TS"
       note "原文件改名: $f.pre-restore-$TS"
+      cp "$WORK/x/$f" "$tgt"
+      chmod 600 "$tgt"
+      wsha=$(sha256sum "$tgt" | cut -d' ' -f1)
+      _journal_action "$tgt" overwrite "$tgt.pre-restore-$TS" "$wsha" ""
+    else
+      cp "$WORK/x/$f" "$tgt"
+      chmod 600 "$tgt"
+      wsha=$(sha256sum "$tgt" | cut -d' ' -f1)
+      _journal_action "$tgt" add "" "$wsha" ""
     fi
-    cp "$WORK/x/$f" "$tgt"
-    chmod 600 "$tgt"
   done
   # age 私钥路径重写为本机路径（换机后 HOME/路径可能不同）
   if [ -f "$CONFIG_DIR/age-identity.txt" ]; then
@@ -953,28 +1267,174 @@ do_kit_import() {
   fi
   rm -rf "$WORK"; WORK=""
   reload_config
+  _journal_commit_if import
   info "凭据回填完成: HOST_TAG=$HOST_TAG · BACKEND=$BACKEND"
   [ "$VAULT_USE_AGE" = 1 ] && note "vault age 层已启用（私钥: $AGE_IDENTITY）"
   return 0
 }
 
+# ---------------- 云端恢复包（R2 ocbkits/ 明文目录 + 明文清单） ----------------
+_include_entries() { # 白名单条目（去注释/空行）
+  [ -f "$1" ] || return 0
+  sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" | sed '/^$/d'
+}
+
+_kit_base_ref() { # REMOTE_CFG 的 crypt 底层引用，如 r2:omarchy-cfg-backup
+  local rconf block ref
+  rconf=$(_rclone_conf_path)
+  [ -f "$rconf" ] || return 1
+  block=$(_rclone_block "$rconf" "$REMOTE_CFG")
+  ref=$(printf '%s\n' "$block" | sed -n 's/^remote[[:space:]]*=[[:space:]]*//p' | head -1)
+  [ -n "$ref" ] || return 1
+  printf '%s' "$ref"
+}
+
+_kit_write_meta() { # outfile kitfile —— 明文清单（云端列表展示备份时间/可恢复内容）
+  local cfg_e vault_e
+  cfg_e=$(_include_entries "$INCLUDE_FILE" | jq -R -s 'split("\n") | map(select(length > 0))')
+  vault_e=$(_include_entries "$VAULT_INCLUDE_FILE" | jq -R -s 'split("\n") | map(select(length > 0))')
+  jq -n --arg created "$TS" --arg host "$HOST_TAG" --arg tool "$VERSION" --arg backend "$BACKEND" \
+        --argjson age "$VAULT_USE_AGE" --argjson size "$(stat -c %s "$2")" \
+        --arg sha "$(sha256sum "$2" | cut -d' ' -f1)" \
+        --argjson cfg "$cfg_e" --argjson vault "$vault_e" \
+    '{schema:1, kind:"ocb-kit-meta", created:$created, host_tag:$host, tool:$tool,
+      backend:$backend, vault_use_age:($age == 1), size_bytes:$size, sha256:$sha,
+      cfg:{count:($cfg | length), entries:$cfg}, vault:{count:($vault | length), entries:$vault}}' > "$1"
+}
+
+_kit_publish() { # kitfile metafile；成功=0，跳过/失败=1（本地包已保存，不致命）
+  [ "$BACKEND" = rclone ] || return 1
+  command -v rclone >/dev/null 2>&1 || { warn "rclone 未安装，跳过恢复包云端发布"; return 1; }
+  local ref name
+  ref=$(_kit_base_ref) || { warn "找不到 rclone 底层远端，跳过恢复包云端发布"; return 1; }
+  name=$(basename "$1")
+  name="${name%.ocbkit}"
+  local dir="$ref/ocbkits/$HOST_TAG"
+  if rclone copyto "$1" "$dir/$name.ocbkit" && rclone copyto "$2" "$dir/$name.meta.json"; then
+    info "恢复包已发布到云端: $dir/"
+    return 0
+  fi
+  warn "恢复包云端发布失败（本地已保存: $1）"
+  return 1
+}
+
+_cf_ensure() {
+  command -v cf >/dev/null 2>&1 || die "需要 Cloudflare CLI（cf）: npm i -g cf"
+  if ! cf auth whoami >/dev/null 2>&1; then
+    step "需要 Cloudflare 账号授权（即将打开浏览器）"
+    cf auth login --browser || die "Cloudflare 授权失败"
+    info "Cloudflare 授权完成"
+  fi
+}
+
+_cf_json() { NO_COLOR=1 cf -q "$@" 2>/dev/null; }
+
+_cloud_kits_json() { # stdout: [{key,size,meta}]，按备份时间倒序
+  local bucket="$KIT_BUCKET" objs k mk size meta arr='[]'
+  objs=$(_cf_json r2 objects list --bucket-name "$bucket" --prefix "ocbkits/" --per-page 200) \
+    || die "无法列出云端恢复包（bucket: $bucket）"
+  [ -n "$objs" ] || objs='[]'
+  while IFS= read -r k; do
+    [ -n "$k" ] || continue
+    mk="${k%.ocbkit}.meta.json"
+    meta=$(_cf_json r2 objects get "$mk" --bucket-name "$bucket" --text | jq -c . 2>/dev/null) || meta=""
+    [ -n "$meta" ] || meta='{"kind":"ocb-kit-meta"}'
+    size=$(jq -r --arg k "$k" '[.[] | select(.key==$k) | .size][0] // 0' <<<"$objs")
+    arr=$(jq -c --arg key "$k" --argjson size "${size:-0}" --argjson meta "$meta" \
+      '. + [{key:$key, size:$size, meta:$meta}]' <<<"$arr")
+  done < <(jq -r '.[].key | select(endswith(".ocbkit"))' <<<"$objs")
+  jq -c 'sort_by(.meta.created) | reverse' <<<"$arr"
+}
+
+_cloud_print_kits() { # kits_json —— 编号列表：备份时间 · 可恢复内容
+  local row i=0 created host cfgc vaultc age size preview
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    i=$((i + 1))
+    created=$(jq -r '.meta.created // "未知时间"' <<<"$row")
+    host=$(jq -r '.meta.host_tag // "未知主机"' <<<"$row")
+    cfgc=$(jq -r '.meta.cfg.count // 0' <<<"$row")
+    vaultc=$(jq -r '.meta.vault.count // 0' <<<"$row")
+    age=$(jq -r 'if .meta.vault_use_age then "开" else "关" end' <<<"$row")
+    size=$(jq -r '.size' <<<"$row")
+    printf '[%d] %s · %s · 配置 %s 项 · 密钥 %s 项 · age:%s · %sB\n' \
+      "$i" "$created" "$host" "$cfgc" "$vaultc" "$age" "$size"
+    preview=$(jq -r '(.meta.cfg.entries[:6] // []) | join("  ")' <<<"$row")
+    if [ -n "$preview" ] && [ "$preview" != "null" ] && [ "$preview" != "" ]; then
+      printf '    可恢复内容: %s\n' "$preview"
+    fi
+  done < <(jq -c '.[]' <<<"$1")
+}
+
+DL_KIT=""
+_cloud_pick_kit() { # [select] → 下载选定恢复包到 DL_KIT（选择交互走 /dev/tty）
+  local select="${1:-}" kits total n row key
+  step "发现云端恢复包（bucket: $KIT_BUCKET，前缀 ocbkits/）"
+  kits=$(_cloud_kits_json)
+  total=$(jq 'length' <<<"$kits")
+  [ "$total" -gt 0 ] || die "云端没有恢复包。老机器先执行: omarchy-cfg-backup kit export（发布到云端）"
+  _cloud_print_kits "$kits"
+  if [ -n "$select" ]; then
+    n=$select
+  else
+    if [ -t 0 ]; then
+      read -r -p "选择恢复包编号 [1-$total]: " n || die "未选择恢复包"
+    else
+      die "非交互环境请用 --select N 指定恢复包"
+    fi
+  fi
+  [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$total" ] || die "无效选择: $n"
+  row=$(jq -c --argjson i "$n" '.[$i - 1]' <<<"$kits")
+  key=$(jq -r '.key' <<<"$row")
+  DL_KIT=$(mktemp --suffix=.ocbkit)
+  step "下载恢复包: $key"
+  cf r2 objects get "$key" --bucket-name "$KIT_BUCKET" > "$DL_KIT" 2>/dev/null \
+    || die "恢复包下载失败: $key"
+  [ -s "$DL_KIT" ] || die "恢复包下载为空: $key"
+  info "恢复包已就绪: $(basename "$key")"
+}
+
+do_kit_list() {
+  _cf_ensure
+  local kits total
+  kits=$(_cloud_kits_json)
+  total=$(jq 'length' <<<"$kits")
+  if [ "$total" -eq 0 ]; then
+    info "云端没有恢复包（bucket: $KIT_BUCKET，前缀 ocbkits/）"
+    return 0
+  fi
+  info "云端恢复包（$total 个）:"
+  _cloud_print_kits "$kits"
+}
+
 do_restore() {
-  local kit="" yes=0 pf="" target="$ROOT"
+  local kit="" yes=0 pf="" target="$ROOT" sel="" newid=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes) yes=1; shift ;;
+      --new-identity) newid=1; shift ;;
       --passphrase-file) [ $# -ge 2 ] || die "restore: --passphrase-file 缺参数"; pf=$2; shift 2 ;;
       --target) [ $# -ge 2 ] || die "restore: --target 缺参数"; target=$2; shift 2 ;;
+      --select) [ $# -ge 2 ] || die "restore: --select 缺参数"; sel=$2; shift 2 ;;
       -*) die "restore: 未知选项 $1" ;;
       *) [ -z "$kit" ] || die "restore: 只接受一个恢复包"; kit=$1; shift ;;
     esac
   done
-  [ -n "$kit" ] || die "用法: restore <恢复包文件> [--yes] [--passphrase-file F] [--target DIR]"
 
   echo "omarchy-cfg-backup restore — 换机一行恢复"
   echo "（只做恢复，绝不 push；monitors.lua / *.bak* 永不覆盖）"
   echo
-  echo "== 1/4 回填凭据与配置 =="
+  _journal_begin restore
+  if [ -z "$kit" ]; then
+    echo "== 0/4 云端恢复包（免携带）=="
+    _cf_ensure
+    _cloud_pick_kit "$sel"
+    kit="$DL_KIT"
+    echo
+  fi
+  [ -f "$kit" ] || die "恢复包不存在: $kit"
+
+  echo "== 1/4 回填凭据与配置（恢复包: $kit）=="
   if [ -n "$pf" ]; then
     do_kit_import "$kit" --passphrase-file "$pf"
   else
@@ -1019,18 +1479,48 @@ do_restore() {
     read -r -p "确认恢复 cfg${extra} 到 $target ? [y/N] " ans || ans=""
     case "$ans" in
       y|Y) : ;;
-      *) step "已取消（未写入任何文件）"; return 0 ;;
+      *)
+        _journal_commit_if restore
+        step "已取消（配置已回填但未恢复文件；undo-restore 可撤销回填）"
+        return 0
+        ;;
     esac
   fi
   do_pull cfg --yes --target "$target"
   if [ -n "$vault_list" ]; then
     do_pull vault --yes --target "$target"
   fi
+
   echo
+  step "备份身份选择（当前 HOST_TAG=$HOST_TAG）"
+  local ans2="" nt=""
+  if [ "$newid" = 1 ]; then
+    ans2="2"
+  elif [ "$yes" = 1 ] || [ ! -t 0 ]; then
+    ans2="1"
+  else
+    echo "  [1] 沿用当前身份 —— 老机器不再备份时选它"
+    echo "  [2] 改用新身份（$(_default_host_tag)）—— 与老机器并行共存时选它"
+    read -r -p "选择 [1/2]（默认 1）: " ans2 || ans2="1"
+  fi
+  case "$ans2" in
+    2|n|N)
+      nt=$(_default_host_tag)
+      _journal_host_tag "$HOST_TAG" "$nt"
+      _set_host_tag "$nt"
+      info "已切换备份身份: HOST_TAG=$nt（push 走独立前缀，不与老机器互踩）"
+      ;;
+    *)
+      note "沿用 HOST_TAG=$HOST_TAG"
+      note "注意：若老机器仍在备份，两台会互写同一前缀（push 时会被前哨拦截）；并行共存请选 2"
+      ;;
+  esac
+
+  echo
+  _journal_commit_if restore
   info "换机恢复完成！"
   note "后续手动步骤: hyprctl reload · omarchy restart shell"
   note "各 agent 登录态换机后需重新登录（预期行为，不是恢复失败）"
-  note "备份身份沿用 HOST_TAG=$HOST_TAG；如需新身份，编辑 $CONFIG_DIR/config"
   note "确认无误后 push 即可以当前状态继续备份"
 }
 # ---------------- 状态栏组件支撑 ----------------
@@ -1397,10 +1887,12 @@ main() {
       case "$sub" in
         export) do_kit_export "$@" ;;
         import) do_kit_import "$@" ;;
-        *) die "kit 用法: kit export | kit import <恢复包>（omarchy-cfg-backup help）" ;;
+        list)   do_kit_list "$@" ;;
+        *) die "kit 用法: kit export | kit list | kit import <恢复包>（omarchy-cfg-backup help）" ;;
       esac
       ;;
     restore) do_restore "$@" ;;
+    undo-restore) do_undo_restore "$@" ;;
     widget-status) do_widget_status "$@" ;;
     widget-push) do_widget_push "$@" ;;
     widget-verify) do_widget_verify "$@" ;;
