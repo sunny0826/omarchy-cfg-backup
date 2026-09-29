@@ -718,8 +718,9 @@ do_widget_status() {
   if [ ! -f "$INCLUDE_FILE" ] || [ ! -f "$VAULT_INCLUDE_FILE" ]; then
     configured=false
   fi
+  local out=""
   if [ -s "$f" ]; then
-    jq -c --argjson now "$now" --argjson auto "$auto_json" --argjson keepN "$KEEP_N" --argjson conf "$configured" '
+    out=$(jq -c --argjson now "$now" --argjson auto "$auto_json" --argjson keepN "$KEEP_N" --argjson conf "$configured" '
       def age_min: if .epoch then (($now - .epoch) / 60 | floor) else -1 end;
       def lvl: if .epoch == null then 2
                elif age_min <= 1440 then 0
@@ -730,11 +731,14 @@ do_widget_status() {
       | . + {level: ([.cfg.level, .vault.level] | max),
              verify: ($s.verify // null),
              pushCount: (($s.cfg.pushCount // 0) + ($s.vault.pushCount // 0)),
-             autoSync: $auto, keepN: $keepN, configured: $conf, now: $now}' "$f"
-  else
-    jq -cnc --argjson auto "$auto_json" --argjson keepN "$KEEP_N" --argjson conf "$configured" --argjson now "$now" \
-      '{cfg:{ageMin:-1,level:2},vault:{ageMin:-1,level:2},level:2,verify:null,pushCount:0,autoSync:$auto,keepN:$keepN,configured:$conf,now:$now}'
+             autoSync: $auto, keepN: $keepN, configured: $conf, now: $now}' "$f" 2>/dev/null) || out=""
   fi
+  if [ -z "$out" ]; then
+    # 无状态文件或状态损坏：输出兜底 JSON，绝不让状态栏拿到空/半截数据
+    out=$(jq -cnc --argjson auto "$auto_json" --argjson keepN "$KEEP_N" --argjson conf "$configured" --argjson now "$now" \
+      '{cfg:{ageMin:-1,level:2},vault:{ageMin:-1,level:2},level:2,verify:null,pushCount:0,autoSync:$auto,keepN:$keepN,configured:$conf,now:$now}')
+  fi
+  printf '%s\n' "$out"
 }
 
 do_widget_push() {
