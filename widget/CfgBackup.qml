@@ -29,6 +29,10 @@ Panel {
   property string tip: "备份状态载入中…"
   property real spinAngle: 0
 
+  // 根组件尺寸必须显式给出，否则 bar 槽位渲染为 0×0（现象：IPC 通但栏上不可见）
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
   function refresh() {
     if (!statusProc.running)
       statusProc.running = true
@@ -101,7 +105,12 @@ Panel {
     }
 
     function refresh(): void {
-      root.broadcast("refresh")
+      // Panel 基类没有 broadcast（那是 BarWidget 的），内联多实例广播
+      var items = root.bar && typeof root.bar.moduleWidgets === "function" ? root.bar.moduleWidgets(root.moduleName) : [root]
+      for (var i = 0; i < items.length; i++) {
+        if (items[i] && typeof items[i].refresh === "function")
+          items[i].refresh()
+      }
     }
   }
 
