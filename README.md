@@ -17,10 +17,12 @@ Omarchy 配置与密钥的**单向加密备份** CLI：打包白名单 → zstd 
 ## 快速开始（开箱即用）
 
 ```bash
-git clone <repo> && cd omarchy-cfg-backup
-./install.sh                        # 链接 CLI + 默认白名单 + 状态栏组件 + systemd 单元
-omarchy-cfg-backup setup            # 一键向导（下面全部自动完成）
+curl -fsSL https://omarchy-backup.guoxudong.io | bash
 ```
+
+一条命令完成安装 + 配置向导。选项：`bash -s -- --no-setup` 只装不配；
+`OCB_VERSION=v1.0.0` 钉版本（默认 main）。重新执行即升级/修复（幂等）。
+手动方式：下载仓库解压后 `./install.sh`，再跑 `omarchy-cfg-backup setup`。
 
 `setup` 向导内容（幂等，可重复执行）：
 
