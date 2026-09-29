@@ -126,8 +126,19 @@ omarchy-cfg-backup kit import <恢复包>  # 只回填凭据与配置，不落�
 
 ## 状态栏组件（Omarchy shell 插件）
 
-`widget/` 目录是 Omarchy 状态栏组件（Quickshell 插件），`install.sh` 会自动部署到
-`~/.config/omarchy/plugins/ocb.status/` 并保持同步。
+组件即**标准 Omarchy 插件**：`manifest.json` 在仓库根（entryPoint `widget/CfgBackup.qml`），
+符合官方 manifest schema（可 `omarchy plugin validate` 校验），带 MIT LICENSE。
+两条安装方式产出等价布局：
+
+```bash
+# 方式一：随 install.sh 自动部署（curl|bash 默认，CLI + 组件一起装）
+./install.sh                                            # → ~/.config/omarchy/plugins/ocb.status/
+
+# 方式二：官方插件通道（只装状态栏组件）
+omarchy plugin add https://github.com/sunny0826/omarchy-cfg-backup.git --enable
+```
+
+启用与布局：
 
 ```bash
 omarchy plugin enable ocb.status --before io.github.manateelazycat.tray-bar

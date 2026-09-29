@@ -16,7 +16,8 @@ tests/e2e.sh       # e2e 55 项（换机恢复三条真实旅程 + 负面用例�
 - 全部在临时目录 + 本地模拟 S3（`rclone serve s3`）中进行，不触碰真实家目录与云端
 - **E2E-1** 换机全流程（local + age vault）：对应 T4.6 核心路径、T4.1、T4.3、T4.4
 - **E2E-2** 换机全流程（真实 rclone：serve s3 + crypt + age）：对应 T3.1、T3.5/T3.6 主链路
-- **E2E-3** bootstrap 一行命令安装 + `--restore` 恢复：对应 T1.2、T1.4
+- **E2E-3** bootstrap 一行命令安装 + `--restore` 恢复：对应 T1.2、T1.4；并用官方
+  `omarchy plugin validate` 校验仓库根（plugin add 通道）与部署副本
 - **E2E-4** 负面用例：错误口令 / 篡改包 / 空云端 / 非交互未确认（对应 T5 思路）
 - test.sh 另覆盖 T2.2、T2.6、T3.2–T3.4、T4.1–T4.2、恢复包（kit export/import）往返
 

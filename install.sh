@@ -23,9 +23,13 @@ done
 chmod 600 "$CFG/config" 2>/dev/null || true
 
 # 状态栏组件（Omarchy shell 插件）
+# 部署布局与 manifest.json 的 entryPoints 一致（widget/CfgBackup.qml），
+# 与 `omarchy plugin add` 克隆整仓的布局等价，两条安装通道互通。
 PLUGIN_DIR="$HOME/.config/omarchy/plugins/ocb.status"
-mkdir -p "$PLUGIN_DIR"
-cp "$PROJ/widget/manifest.json" "$PROJ/widget/CfgBackup.qml" "$PLUGIN_DIR/"
+rm -rf "$PLUGIN_DIR"
+mkdir -p "$PLUGIN_DIR/widget"
+cp "$PROJ/manifest.json" "$PLUGIN_DIR/"
+cp "$PROJ/widget/CfgBackup.qml" "$PLUGIN_DIR/widget/"
 echo "✔ 状态栏组件: $PLUGIN_DIR"
 
 # systemd user 单元（自动同步 timer；开关由面板/omarchy-cfg-backup auto-sync 控制）

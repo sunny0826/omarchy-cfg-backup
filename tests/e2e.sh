@@ -246,7 +246,10 @@ else
 fi
 assert "bootstrap 恢复输出含完成标记" grep -q '换机恢复完成' "$T/bootstrap-restore.log"
 assert "CLI 已安装到 ~/.local/bin" test -x "$C_HOME/.local/bin/omarchy-cfg-backup"
-assert "状态栏组件已部署" test -f "$C_HOME/.config/omarchy/plugins/ocb.status/CfgBackup.qml"
+assert "状态栏组件已部署" test -f "$C_HOME/.config/omarchy/plugins/ocb.status/widget/CfgBackup.qml"
+assert "组件 manifest 已部署" test -f "$C_HOME/.config/omarchy/plugins/ocb.status/manifest.json"
+assert "部署副本符合插件规范" omarchy plugin validate "$C_HOME/.config/omarchy/plugins/ocb.status"
+assert "仓库根符合插件规范（plugin add 通道）" omarchy plugin validate "$PROJ"
 assert "bootstrap 恢复 .bashrc 一致" cmp -s "$A_HOME/.bashrc" "$C_HOME/.bashrc"
 assert "bootstrap 恢复 vault 600" bash -c 'test "$(stat -c %a "$0/.config/gh/hosts.yml")" = 600' "$C_HOME"
 

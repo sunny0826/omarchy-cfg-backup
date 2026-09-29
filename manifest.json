@@ -2,17 +2,17 @@
   "schemaVersion": 1,
   "id": "ocb.status",
   "name": "Omarchy 备份状态",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "sunny0826",
   "license": "MIT",
   "description": "Omarchy 配置与密钥备份（omarchy-cfg-backup）的状态栏组件：新鲜度指示、一键备份、差异速览。",
   "kinds": ["bar-widget"],
   "entryPoints": {
-    "barWidget": "CfgBackup.qml"
+    "barWidget": "widget/CfgBackup.qml"
   },
   "barWidget": {
     "displayName": "备份状态",
-    "description": "配置仓/密钥库备份新鲜度；左键立即备份，右键查看差异。",
+    "description": "配置仓/密钥库备份新鲜度；左键开面板，右键立即同步。",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"
