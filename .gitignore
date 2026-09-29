@@ -1,0 +1,15 @@
+# 任何真实凭据/密钥一律禁止入库
+age-identity.txt
+first-run-secrets.txt
+rclone.conf
+*.key
+*.pem
+*.p12
+.env
+.env.*
+
+# 本地状态与临时文件
+state/
+*.bak
+*.bak.*
+.DS_Store

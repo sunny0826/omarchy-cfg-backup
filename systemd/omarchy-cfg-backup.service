@@ -1,0 +1,6 @@
+[Unit]
+Description=Omarchy 配置/密钥备份（widget-push，含桌面通知）
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/omarchy-cfg-backup widget-push

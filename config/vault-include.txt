@@ -1,0 +1,18 @@
+# B 类白名单 — 密钥保险库
+# 一行一个路径；# 开头为注释；不存在的条目自动跳过。
+#
+# 强烈建议先用自动扫描生成候选，人工过目后定稿本文件：
+#   omarchy-cfg-backup vault scan --emit-include /tmp/cand.txt
+# 扫描器按「文件名 + 权限 + 内容特征」三层信号找出本机凭据文件并分级。
+#
+# 示例（按你实际使用的工具修改）：
+# ~/.config/gh/hosts.yml                      # GitHub CLI 登录态
+# ~/.config/example-proxy/config.yaml         # 代理订阅（通常含节点密钥）
+# ~/.config/example-proxy/subscriptions.json
+# ~/.config/example-agent/credentials.json    # AI agent 登录态
+# ~/.config/example-agent/config.toml         # 若其中含 API key
+# ~/.ssh/id_ed25519                           # SSH 私钥（注意恢复后的权限）
+#
+# 建议排除（各有更可靠的同步方式或属使用痕迹）：
+# - 浏览器 Cookies / Login Data：设备绑定 + 系统 keyring 派生加密，搬迁常失效
+# - 剪贴板历史、sqlite 状态库、缓存、*.bak*

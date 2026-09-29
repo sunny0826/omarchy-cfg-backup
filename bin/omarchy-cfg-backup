@@ -1,0 +1,1044 @@
+#!/usr/bin/env bash
+# omarchy-cfg-backup — Omarchy 配置/密钥备份 CLI
+# 文档: 见项目 README.md
+# 设计: 单向备份、白名单、人工确认恢复；cfg 与 vault 两仓两管线。
+set -euo pipefail
+
+VERSION="0.3.0"
+
+# ---------------- 基础输出 ----------------
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '✔ %s\n' "$*"; }
+step() { printf '· %s\n' "$*"; }
+warn() { printf '⚠ %s\n' "$*" >&2; }
+note() { printf '    %s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+用法: omarchy-cfg-backup <命令> [选项]
+
+快速开始（新用户）:
+  setup [--auto] [--dry-run]        一键开箱向导：依赖检查 → 默认白名单 →
+                                    自动开通 R2（桶/Token/rclone）→ age 密钥 →
+                                    首次备份+校验。幂等，可重复执行。
+
+配置备份（A 类 · 普通配置）:
+  push [--dry-run]              打包白名单 → 压缩 → 上传时间戳快照 + latest + MANIFEST
+  list                          列出该主机的云端快照
+  pull [id|latest] [--yes] [--target DIR]
+                                下载解包到临时目录 → dry-run 覆盖预览；--yes 才真正落盘
+  status                        本地白名单 vs 上次 MANIFEST 差异
+  verify                        下载 latest 完整解一遍并核对 sha256
+
+密钥保险库（B 类 · 密钥）:
+  vault scan [--emit-include F] 只读扫描应加密文件（三层信号分级 + 权限告警）
+  vault push|list|pull|verify|status   同上，走独立远端 + 可选 age 层
+
+其他:
+  widget-status                 状态栏组件数据源（单行 JSON，无网络）
+  widget-push                   状态栏一键备份（两仓 + 桌面通知）
+  widget-verify                 状态栏一键校验（两仓 sha256 + 桌面通知）
+  auto-sync [on|off|status]     自动同步开关（systemd user timer，每 24 小时）
+  doctor                        环境体检（依赖/远端/配置/权限）
+  version | help
+
+全局选项:
+  --yes          pull 时确认覆盖（默认只预览）
+  --target DIR   恢复到指定目录（默认 $ROOT，即家目录）
+  --dry-run      push 时只打包不上传
+  --no-age       vault push 临时跳过 age 层
+
+安全默认: monitors.lua / *.bak* / 缓存永不进包；pull 永不覆盖 monitors.lua；
+覆盖前原文件改名为 .pre-restore-<时间>；vault 文件落盘后强制 chmod 600。
+EOF
+}
+
+# ---------------- 配置 ----------------
+CONFIG_DIR="${OCB_CONFIG_DIR:-$HOME/.config/omarchy-cfg-backup}"
+if [ -f "$CONFIG_DIR/config" ]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG_DIR/config"
+fi
+: "${BACKEND:=rclone}"                       # rclone | local
+: "${REMOTE_CFG:=r2-crypt}"                  # rclone 远端（含 bucket）
+: "${REMOTE_VAULT:=r2-vault-crypt}"
+: "${LOCAL_ROOT:=$HOME/.local/share/omarchy-cfg-backup/remote}"  # BACKEND=local 时
+: "${HOST_TAG:=$(hostname)}"
+: "${KEEP_N:=10}"
+: "${VAULT_USE_AGE:=0}"
+: "${AGE_RECIPIENT:=}"                       # age1... 公钥（加密）
+: "${AGE_IDENTITY:=}"                        # 私钥文件路径（解密）
+: "${ROOT:=$HOME}"                           # 打包/恢复的根（测试可覆写）
+: "${INCLUDE_FILE:=$CONFIG_DIR/include.txt}"
+: "${VAULT_INCLUDE_FILE:=$CONFIG_DIR/vault-include.txt}"
+: "${STATE_DIR:=$HOME/.local/state/omarchy-cfg-backup}"   # 本地状态（供状态栏组件读取）
+
+TS="$(date +%Y-%m-%dT%H-%M-%S%z)"
+SUF=".tar.zst"
+WORK=""
+SCAN_TMP=""
+cleanup() {
+  local rc=$?
+  if [ -n "$WORK" ]; then rm -rf "$WORK"; fi
+  if [ -n "$SCAN_TMP" ]; then rm -rf "$SCAN_TMP"; fi
+  return "$rc"
+}
+trap cleanup EXIT
+
+# 永不进包/永不恢复（basename 或路径，ERE）
+EXCLUDE_RE='(^|/)\.git(/|$)|(^|/)(monitors\.lua)$|\.bak|\.mmdb$|(^|/)cache\.db$|(^|/)(cache|caches|log|logs|node_modules|__pycache__|GPUCache|CachedData)(/|$)|(~|\.sw[pot])$|\.sqlite-(shm|wal)$|\.pre-restore-'
+
+need() { command -v "$1" >/dev/null 2>&1 || die "缺少依赖: $1（$2）"; }
+
+excluded() { [[ $1 =~ $EXCLUDE_RE ]]; }
+
+# ---------------- 远端抽象（rclone | local）----------------
+_remote_name() { [ "$1" = cfg ] && echo "$REMOTE_CFG" || echo "$REMOTE_VAULT"; }
+
+_remote_put() { # kind localfile key
+  if [ "$BACKEND" = local ]; then
+    local dst="$LOCAL_ROOT/$1/$3"
+    mkdir -p "$(dirname "$dst")"
+    cp -f "$2" "$dst"
+  else
+    rclone copyto "$2" "$(_remote_name "$1"):$3"
+  fi
+}
+
+_remote_get() { # kind key localfile
+  if [ "$BACKEND" = local ]; then
+    local src="$LOCAL_ROOT/$1/$2"
+    [ -f "$src" ] || die "远端不存在: $2"
+    cp -f "$src" "$3"
+  else
+    rclone copyto "$(_remote_name "$1"):$2" "$3"
+  fi
+}
+
+_remote_del() { # kind key
+  if [ "$BACKEND" = local ]; then
+    rm -f "$LOCAL_ROOT/$1/$2"
+  else
+    rclone deletefile "$(_remote_name "$1"):$2" || true
+  fi
+}
+
+_remote_list() { # kind → 列出 omarchy/$HOST_TAG/ 下文件名，一行一个
+  if [ "$BACKEND" = local ]; then
+    find "$LOCAL_ROOT/$1/omarchy/$HOST_TAG" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null || true
+  else
+    rclone lsf "$(_remote_name "$1"):omarchy/$HOST_TAG/" --files-only --format p 2>/dev/null | sed 's:/$::' || true
+  fi
+}
+
+_remote_reachable() {
+  if [ "$BACKEND" = local ]; then
+    mkdir -p "$LOCAL_ROOT"
+  else
+    rclone lsd "$(_remote_name "$1"):" >/dev/null 2>&1
+  fi
+}
+
+# ---------------- 收集与清单 ----------------
+_collect() { # includefile → stdout: 相对 $ROOT 的路径
+  local inc=$1 line abs rel
+  [ -f "$inc" ] || die "白名单不存在: $inc"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -z "$line" ] && continue
+    abs="${line/#\~/$ROOT}"
+    abs="${abs%/}"
+    case "$abs" in
+      "$ROOT"/*) : ;;
+      *) warn "跳过（不在 ROOT 下）: $line"; continue ;;
+    esac
+    rel="${abs#"$ROOT"/}"
+    if [ -d "$abs" ]; then
+      find "$abs" -type f -printf '%P\n' 2>/dev/null | while IFS= read -r p; do
+        printf '%s\n' "$rel/$p"
+      done
+    elif [ -f "$abs" ]; then
+      printf '%s\n' "$rel"
+    else
+      warn "白名单条目不存在，跳过: $line"
+    fi
+  done < "$inc" | while IFS= read -r rel; do
+    excluded "$rel" || printf '%s\n' "$rel"
+  done | sort -u
+}
+
+_build_manifest() { # kind filelist → stdout JSON
+  local kind=$1 list=$2
+  local entries="$WORK/entries"
+  : > "$entries"
+  local rel sha size mode mt
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    sha=$(sha256sum "$ROOT/$rel" | cut -d' ' -f1)
+    size=$(stat -c %s "$ROOT/$rel")
+    mode=$(stat -c %a "$ROOT/$rel")
+    mt=$(stat -c %y "$ROOT/$rel" | cut -d'.' -f1)
+    printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$sha" "$size" "$mode" "$mt" >> "$entries"
+  done < "$list"
+  jq -Rn \
+    --arg created "$TS" --arg host "$HOST_TAG" --arg kind "$kind" --arg snap "$TS$SUF" --arg ver "$VERSION" '
+    [inputs | split("\t") | {path:.[0], sha256:.[1], size:(.[2]|tonumber), mode:.[3], mtime:.[4]}] as $f
+    | {created:$created, hostname:$host, kind:$kind, snapshot:$snap, tool:$ver, file_count:($f|length), files:$f}' < "$entries"
+}
+
+# 插件清单（方案要求：只记 id + git URL，不备份源码树）
+_attach_plugins() { # kind manifestfile
+  [ "$1" = cfg ] || return 0
+  [ -d "$ROOT/.config/omarchy/plugins" ] || return 0
+  local out="$WORK/plugins.jsonl" id remote d
+  : > "$out"
+  for d in "$ROOT/.config/omarchy/plugins"/*/; do
+    [ -d "$d" ] || continue
+    id=$(basename "$d")
+    remote=$(git -C "$d" remote get-url origin 2>/dev/null || echo "local-only")
+    jq -n --arg id "$id" --arg remote "$remote" '{id:$id, remote:$remote}' >> "$out"
+  done
+  jq --slurpfile p "$out" '.plugins = $p' "$2" > "$2.new" && mv "$2.new" "$2"
+}
+
+# ---------------- push ----------------
+do_push() { # kind [flags...]
+  local kind=$1; shift
+  local dry=0 use_age="$VAULT_USE_AGE"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --no-age) use_age=0; shift ;;
+      *) die "push: 未知选项 $1" ;;
+    esac
+  done
+  [ "$kind" = cfg ] && use_age=0
+  need tar "pacman -S tar"
+  need zstd "pacman -S zstd"
+  need jq "pacman -S jq"
+  need sha256sum "coreutils"
+  if [ "$BACKEND" = rclone ] && [ "$dry" = 0 ]; then need rclone "pacman -S rclone"; fi
+  local ageext=""
+  if [ "$use_age" = 1 ]; then
+    need age "pacman -S age"
+    [ -n "$AGE_RECIPIENT" ] || die "VAULT_USE_AGE=1 需要配置 AGE_RECIPIENT（age 公钥）"
+    ageext=".age"
+  fi
+
+  WORK=$(mktemp -d)
+  local inc
+  if [ "$kind" = cfg ]; then inc="$INCLUDE_FILE"; else inc="$VAULT_INCLUDE_FILE"; fi
+  local list="$WORK/files"
+  _collect "$inc" > "$list"
+  [ -s "$list" ] || die "白名单收集到 0 个文件: $inc"
+  local n; n=$(wc -l < "$list")
+  step "收集 $n 个文件（白名单: $inc）"
+
+  _build_manifest "$kind" "$list" > "$WORK/MANIFEST.json"
+  _attach_plugins "$kind" "$WORK/MANIFEST.json"
+
+  local snap="$TS$SUF"
+  step "打包 $snap"
+  tar -C "$ROOT" --zstd -cf "$WORK/$snap" -T "$list"
+  zstd -tq "$WORK/$snap"
+  local up="$WORK/$snap"
+  if [ -n "$ageext" ]; then
+    step "age 加密"
+    age -r "$AGE_RECIPIENT" -o "$up$ageext" "$up"
+    up="$up$ageext"
+  fi
+  local size; size=$(stat -c %s "$up")
+
+  if [ "$dry" = 1 ]; then
+    info "dry-run: 打包完成（$n 文件, $size 字节），未上传"
+    note "上传目标: $(_remote_name "$kind"):omarchy/$HOST_TAG/"
+    return 0
+  fi
+
+  _remote_reachable "$kind" || die "远端不可达: $(_remote_name "$kind")（BACKEND=$BACKEND）"
+  step "上传快照 + latest + MANIFEST"
+  _remote_put "$kind" "$up" "omarchy/$HOST_TAG/$snap$ageext"
+  _remote_put "$kind" "$up" "omarchy/$HOST_TAG/latest$SUF$ageext"
+  if [ -n "$ageext" ]; then
+    age -r "$AGE_RECIPIENT" -o "$WORK/MANIFEST.json$ageext" "$WORK/MANIFEST.json"
+    _remote_put "$kind" "$WORK/MANIFEST.json$ageext" "omarchy/$HOST_TAG/MANIFEST.json$ageext"
+  else
+    _remote_put "$kind" "$WORK/MANIFEST.json" "omarchy/$HOST_TAG/MANIFEST.json"
+  fi
+
+  step "轮转（保留最近 $KEEP_N 份）"
+  local old
+  old=$(_remote_list "$kind" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}' | sort -r | tail -n "+$((KEEP_N + 1))" || true)
+  if [ -n "$old" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] && _remote_del "$kind" "omarchy/$HOST_TAG/$f" && note "清理 $f"
+    done <<< "$old"
+  fi
+  _record_state "$kind" "$snap$ageext" "$n"
+  qs -p "${OMARCHY_PATH:-/usr/share/omarchy}/shell" ipc call ocb.status refresh >/dev/null 2>&1 || true
+  info "push 完成: omarchy/$HOST_TAG/$snap$ageext"
+}
+
+# ---------------- 取回构件 ----------------
+_fetch_latest() { # kind → 设置 DL_SNAP(本地解密后 tar 路径) DL_MANIFEST(本地 manifest 路径)
+  local kind=$1 ageext=""
+  [ "$VAULT_USE_AGE" = 1 ] && [ "$kind" = vault ] && ageext=".age"
+  WORK=$(mktemp -d)
+  local key_snap="omarchy/$HOST_TAG/latest$SUF$ageext"
+  local key_man="omarchy/$HOST_TAG/MANIFEST.json$ageext"
+  step "下载 latest + MANIFEST"
+  _remote_get "$kind" "$key_snap" "$WORK/dl$SUF$ageext"
+  _remote_get "$kind" "$key_man" "$WORK/MANIFEST.json$ageext"
+  DL_SNAP="$WORK/dl$SUF"
+  DL_MANIFEST="$WORK/MANIFEST.json"
+  if [ -n "$ageext" ]; then
+    need age "pacman -S age"
+    [ -n "$AGE_IDENTITY" ] || die "解密需要 AGE_IDENTITY（age 私钥文件）"
+    age -d -i "$AGE_IDENTITY" -o "$DL_SNAP" "$WORK/dl$SUF$ageext"
+    age -d -i "$AGE_IDENTITY" -o "$DL_MANIFEST" "$WORK/MANIFEST.json$ageext"
+  fi
+  zstd -tq "$DL_SNAP"
+}
+
+# ---------------- pull ----------------
+do_pull() { # kind [id] [--yes] [--target DIR]
+  local kind=$1; shift
+  local id="latest"
+  if [ $# -gt 0 ] && [[ $1 != -* ]]; then id=$1; shift; fi
+  local yes=0 target="$ROOT"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      --target) [ $# -ge 2 ] || die "--target 缺参数"; target=$2; shift 2 ;;
+      *) die "pull: 未知选项 $1" ;;
+    esac
+  done
+  [ "$BACKEND" = rclone ] && need rclone "pacman -S rclone"
+
+  local ageext=""
+  [ "$VAULT_USE_AGE" = 1 ] && [ "$kind" = vault ] && ageext=".age"
+
+  if [ "$id" != latest ]; then
+    local hit="" f
+    while IFS= read -r f; do
+      case "$f" in
+        "$id"*.tar.zst|"$id"*.tar.zst.age) hit=$f; break ;;
+      esac
+    done < <(_remote_list "$kind")
+    [ -n "$hit" ] || die "找不到快照: $id（omarchy-cfg-backup list 查看）"
+    WORK=$(mktemp -d)
+    _remote_get "$kind" "omarchy/$HOST_TAG/$hit" "$WORK/dl$SUF$ageext"
+    DL_SNAP="$WORK/dl$SUF"
+    if [ -n "$ageext" ]; then
+      need age "pacman -S age"; [ -n "$AGE_IDENTITY" ] || die "解密需要 AGE_IDENTITY"
+      age -d -i "$AGE_IDENTITY" -o "$DL_SNAP" "$WORK/dl$SUF$ageext"
+    fi
+    zstd -tq "$DL_SNAP"
+  else
+    _fetch_latest "$kind"
+  fi
+
+  step "解包到临时目录"
+  mkdir -p "$WORK/x"
+  tar -C "$WORK/x" -xf "$DL_SNAP"
+
+  step "覆盖预览（目标: $target）"
+  local rel tgt state safe=0 skipped=0
+  local -a plan=()
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    if [[ ${rel##*/} == monitors.lua ]] || excluded "$rel"; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    tgt="$target/$rel"
+    if [ ! -e "$tgt" ]; then state="新增"
+    elif cmp -s "$WORK/x/$rel" "$tgt"; then state="覆盖（内容相同）"
+    else state="覆盖（内容不同）"; fi
+    printf '  %-28s %s\n' "$state" "$rel"
+    plan+=( "$rel" )
+  done < <(cd "$WORK/x" && find . -type f -printf '%P\n' | sort)
+  [ "$skipped" -gt 0 ] && note "安全过滤跳过 $skipped 个文件（monitors.lua/缓存/bak 等）"
+
+  if [ "$yes" != 1 ]; then
+    echo
+    info "dry-run 结束（未写入任何文件）。确认无误后加 --yes 执行恢复。"
+    return 0
+  fi
+
+  step "执行恢复"
+  local rel2
+  for rel2 in "${plan[@]}"; do
+    tgt="$target/$rel2"
+    mkdir -p "$(dirname "$tgt")"
+    if [ -e "$tgt" ]; then
+      mv "$tgt" "$tgt.pre-restore-$TS"
+      note "原文件改名: $rel2.pre-restore-$TS"
+    fi
+    cp -a "$WORK/x/$rel2" "$tgt"
+    [ "$kind" = vault ] && chmod 600 "$tgt"
+  done
+  info "恢复完成: ${#plan[@]} 个文件 → $target"
+  note "后续: hyprctl reload / omarchy restart shell（手动执行）"
+}
+
+# ---------------- status ----------------
+do_status() { # kind
+  local kind=$1
+  [ "$BACKEND" = rclone ] && need rclone "pacman -S rclone"
+  local inc
+  if [ "$kind" = cfg ]; then inc="$INCLUDE_FILE"; else inc="$VAULT_INCLUDE_FILE"; fi
+  WORK=$(mktemp -d)
+  _fetch_latest "$kind" >/dev/null
+  local cur="$WORK/cur.tsv" old="$WORK/old.tsv"
+  : > "$cur"
+  local rel
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    printf '%s\t%s\n' "$rel" "$(sha256sum "$ROOT/$rel" | cut -d' ' -f1)" >> "$cur"
+  done < <(_collect "$inc")
+  jq -r '.files[] | [.path,.sha256] | @tsv' "$DL_MANIFEST" | sort > "$old"
+  sort -o "$cur" "$cur"
+  local added changed removed same
+  added=$(comm -23 <(cut -f1 "$cur") <(cut -f1 "$old") | wc -l)
+  removed=$(comm -13 <(cut -f1 "$cur") <(cut -f1 "$old") | wc -l)
+  changed=$(join -t$'\t' "$cur" "$old" | awk -F'\t' '$2!=$3' | wc -l)
+  same=$(join -t$'\t' "$cur" "$old" | awk -F'\t' '$2==$3' | wc -l)
+  info "status($kind): 相同 $same · 变更 $changed · 新增 $added · 已移除 $removed"
+  join -t$'\t' "$cur" "$old" | awk -F'\t' '$2!=$3 {print "  变更 "$1}' || true
+  comm -23 <(cut -f1 "$cur") <(cut -f1 "$old") | sed 's/^/  新增 /' || true
+  comm -13 <(cut -f1 "$cur") <(cut -f1 "$old") | sed 's/^/  移除 /' || true
+}
+
+# ---------------- verify ----------------
+do_verify() { # kind
+  local kind=$1
+  [ "$BACKEND" = rclone ] && need rclone "pacman -S rclone"
+  _fetch_latest "$kind"
+  step "解包并核对 sha256"
+  mkdir -p "$WORK/x"
+  tar -C "$WORK/x" -xf "$DL_SNAP"
+  local bad=0 total=0 rel want got
+  while IFS=$'\t' read -r rel want; do
+    total=$((total + 1))
+    if [ ! -f "$WORK/x/$rel" ]; then warn "缺失: $rel"; bad=$((bad + 1)); continue; fi
+    got=$(sha256sum "$WORK/x/$rel" | cut -d' ' -f1)
+    if [ "$got" != "$want" ]; then warn "哈希不符: $rel"; bad=$((bad + 1)); fi
+  done < <(jq -r '.files[] | [.path,.sha256] | @tsv' "$DL_MANIFEST")
+  if [ "$bad" -eq 0 ]; then
+    _record_verify "$kind" true
+    qs -p "${OMARCHY_PATH:-/usr/share/omarchy}/shell" ipc call ocb.status refresh >/dev/null 2>&1 || true
+    info "verify($kind): $total 个文件全部通过（zstd ✔ age ✔ sha256 ✔）"
+  else
+    _record_verify "$kind" false
+    die "verify($kind): $bad/$total 个文件校验失败"
+  fi
+}
+
+# ---------------- list ----------------
+do_list() { # kind
+  local kind=$1
+  [ "$BACKEND" = rclone ] && need rclone "pacman -S rclone"
+  local out
+  out=$(_remote_list "$kind")
+  if [ -z "$out" ]; then info "远端没有快照（$(_remote_name "$kind"):omarchy/$HOST_TAG/）"; return 0; fi
+  info "快照（$(_remote_name "$kind"):omarchy/$HOST_TAG/）:"
+  echo "$out" | sort -r | while IFS= read -r f; do
+    local sz="?"
+    if [ "$BACKEND" = local ]; then sz=$(stat -c %s "$LOCAL_ROOT/$1/omarchy/$HOST_TAG/$f" 2>/dev/null || echo "?"); fi
+    printf '  %-46s %sB\n' "$f" "$sz"
+  done
+}
+
+# ---------------- setup（新用户 onboarding 向导）----------------
+_script_dir() { dirname "$(readlink -f "${BASH_SOURCE[0]}")"; }
+
+setup_ensure_files() {
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+  local srcdir="$(_script_dir)/../config" f src
+  for f in include.txt vault-include.txt; do
+    if [ -f "$CONFIG_DIR/$f" ]; then
+      step "白名单已存在，跳过: $f"
+    else
+      src="$srcdir/$f"
+      if [ -f "$src" ]; then
+        cp "$src" "$CONFIG_DIR/$f"
+        info "安装默认白名单: $CONFIG_DIR/$f"
+      else
+        warn "找不到默认白名单 $f（请从项目 config/ 手动复制）"
+      fi
+    fi
+  done
+}
+
+setup_provision_tokens() {
+  # 创建两个桶级限权 Token + rclone 四远端 + crypt 随机密码（密钥零接触：不经终端输出）
+  local accts acct
+  accts=$(cf auth whoami 2>/dev/null | jq -r '.accounts[0].id // empty')
+  [ -n "$accts" ] || die "无法获取 Cloudflare Account ID"
+  acct="$accts"
+  local pgid
+  pgid=$(cf user tokens permission-groups list 2>/dev/null \
+    | jq -r '.[] | select(.name == "Workers R2 Storage Bucket Item Write") | .id' | head -1)
+  [ -n "$pgid" ] || pgid="2efd5506f9c8494dacb1fa10a3e7d5b6"
+
+  local work; work=$(mktemp -d)
+  local bucket pol tok
+  for bucket in omarchy-cfg-backup omarchy-secret-vault; do
+    pol="$work/pol-$bucket.json"
+    printf '[{"effect":"allow","resources":{"com.cloudflare.edge.r2.bucket.%s_default_%s":"*"},"permission_groups":[{"id":"%s","name":"Workers R2 Storage Bucket Item Write"}]}]' \
+      "$acct" "$bucket" "$pgid" > "$pol"
+    tok="$work/tok-$bucket.json"
+    if cf user tokens create --name "ocb-$bucket" --policies "@$pol" > "$tok" 2>/dev/null; then
+      info "已创建限权 Token: ocb-$bucket"
+    else
+      rm -rf "$work"
+      die "Token 创建失败（cf user tokens create）"
+    fi
+  done
+
+  local ak_cfg sk_cfg ak_vault sk_vault
+  ak_cfg=$(jq -r '(.result // .).id' "$work/tok-omarchy-cfg-backup.json")
+  sk_cfg=$(jq -j '(.result // .).value' "$work/tok-omarchy-cfg-backup.json" | sha256sum | cut -d' ' -f1)
+  ak_vault=$(jq -r '(.result // .).id' "$work/tok-omarchy-secret-vault.json")
+  sk_vault=$(jq -j '(.result // .).value' "$work/tok-omarchy-secret-vault.json" | sha256sum | cut -d' ' -f1)
+  local pw_cfg pw_cfg2 pw_vault pw_vault2
+  pw_cfg=$(openssl rand -base64 32)
+  pw_cfg2=$(openssl rand -base64 32)
+  pw_vault=$(openssl rand -base64 32)
+  pw_vault2=$(openssl rand -base64 32)
+  local ep="https://$acct.r2.cloudflarestorage.com"
+
+  rclone config create "$REMOTE_CFG" crypt \
+    remote "r2:omarchy-cfg-backup" \
+    password "$(rclone obscure "$pw_cfg")" \
+    password2 "$(rclone obscure "$pw_cfg2")" >/dev/null
+  rclone config create "$REMOTE_VAULT" crypt \
+    remote "r2-vault:omarchy-secret-vault" \
+    password "$(rclone obscure "$pw_vault")" \
+    password2 "$(rclone obscure "$pw_vault2")" >/dev/null
+  rclone config create r2 s3 provider Cloudflare \
+    access_key_id "$ak_cfg" secret_access_key "$sk_cfg" endpoint "$ep" \
+    no_check_bucket true >/dev/null
+  rclone config create r2-vault s3 provider Cloudflare \
+    access_key_id "$ak_vault" secret_access_key "$sk_vault" endpoint "$ep" \
+    no_check_bucket true >/dev/null
+  chmod 600 "$HOME/.config/rclone/rclone.conf"
+  info "rclone 远端已配置（$REMOTE_CFG / $REMOTE_VAULT，配置文件 600）"
+
+  local rec="$CONFIG_DIR/first-run-secrets.txt"
+  {
+    echo "# omarchy-cfg-backup 首次配置凭据清单"
+    echo "# 请逐条录入密码管理器，确认后执行: shred -u $rec"
+    echo
+    echo "[r2 / ocb-cfg]  Access Key ID     = $ak_cfg"
+    echo "[r2 / ocb-cfg]  Secret Access Key = $sk_cfg"
+    echo "[r2-vault / ocb-vault]  Access Key ID     = $ak_vault"
+    echo "[r2-vault / ocb-vault]  Secret Access Key = $sk_vault"
+    echo "[r2-crypt]  password  = $pw_cfg"
+    echo "[r2-crypt]  password2 = $pw_cfg2"
+    echo "[r2-vault-crypt]  password  = $pw_vault"
+    echo "[r2-vault-crypt]  password2 = $pw_vault2"
+  } > "$rec"
+  chmod 600 "$rec"
+  info "凭据清单已写入 $rec（600）"
+  shred -u "$work"/tok-*.json 2>/dev/null || rm -f "$work"/tok-*.json
+  rm -rf "$work"
+}
+
+setup_cloudflare() {
+  [ "$BACKEND" = local ] && { step "BACKEND=local（测试后端），跳过云端开通"; return 0; }
+  command -v rclone >/dev/null || die "缺少 rclone：sudo pacman -S rclone"
+  command -v age >/dev/null || die "缺少 age：sudo pacman -S age（vault 内层加密用）"
+  if ! command -v cf >/dev/null; then
+    warn "未安装 cf CLI，无法全自动开通。两个选择："
+    note "1) npm i -g cf 后重跑 omarchy-cfg-backup setup"
+    note "2) 手工建桶+Token 后配置 rclone（见 README 手动安装一节）"
+    die "cf CLI 缺失"
+  fi
+  if ! cf auth whoami >/dev/null 2>&1; then
+    step "需要 Cloudflare 账号授权（即将打开浏览器）"
+    cf auth login --browser || die "Cloudflare 登录失败"
+  fi
+  info "Cloudflare 已登录"
+  if cf r2 buckets create --name omarchy-cfg-backup >/dev/null 2>&1; then
+    info "创建 bucket: omarchy-cfg-backup"
+  else
+    step "bucket 已存在，跳过: omarchy-cfg-backup"
+  fi
+  if cf r2 buckets create --name omarchy-secret-vault >/dev/null 2>&1; then
+    info "创建 bucket: omarchy-secret-vault"
+  else
+    step "bucket 已存在，跳过: omarchy-secret-vault"
+  fi
+  if rclone listremotes 2>/dev/null | grep -qx "$REMOTE_CFG:" \
+     && rclone listremotes 2>/dev/null | grep -qx "$REMOTE_VAULT:"; then
+    step "rclone 远端已配置，跳过 Token 与密码生成"
+  else
+    setup_provision_tokens
+  fi
+}
+
+setup_age() {
+  if [ ! -f "$CONFIG_DIR/age-identity.txt" ]; then
+    umask 077
+    age-keygen -o "$CONFIG_DIR/age-identity.txt" >/dev/null 2>&1 || die "age-keygen 失败"
+    chmod 600 "$CONFIG_DIR/age-identity.txt"
+    info "已生成 age 密钥对（identity 600）"
+  else
+    step "age 密钥已存在，复用"
+  fi
+  local pub; pub=$(grep -o 'age1[0-9a-z]*' "$CONFIG_DIR/age-identity.txt" | head -1)
+  [ -n "$pub" ] || die "无法读取 age 公钥"
+  if ! grep -q '^AGE_RECIPIENT=' "$CONFIG_DIR/config" 2>/dev/null; then
+    {
+      echo ""
+      echo "# age 内层加密（setup 写入 $(date '+%F')）"
+      echo "VAULT_USE_AGE=1"
+      echo "AGE_RECIPIENT=$pub"
+      echo "AGE_IDENTITY=$CONFIG_DIR/age-identity.txt"
+    } >> "$CONFIG_DIR/config"
+    chmod 600 "$CONFIG_DIR/config"
+    info "config 已启用 VAULT_USE_AGE=1"
+  else
+    step "config 的 age 配置已存在，跳过"
+  fi
+}
+
+do_setup() {
+  local auto=0 dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --auto) auto=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      *) die "setup: 未知选项 $1" ;;
+    esac
+  done
+  echo "omarchy-cfg-backup setup — 开箱即用向导"
+  echo "（密钥只写入本地 600 文件，不经终端/对话输出；可重复执行，已配置项自动跳过）"
+  echo
+
+  if [ "$dry" = 1 ]; then
+    step "[dry-run] 将执行: 依赖检查 → 安装默认白名单 → 云端开通（桶/Token/rclone）→ age 密钥 → 首次备份+校验"
+    info "dry-run 结束，未做任何变更"
+    return 0
+  fi
+
+  echo "== 1/5 依赖检查 =="
+  local c missing=0
+  for c in tar zstd jq sha256sum openssl; do
+    command -v "$c" >/dev/null || { warn "缺少 $c"; missing=1; }
+  done
+  [ "$BACKEND" = local ] || { command -v rclone >/dev/null || { warn "缺少 rclone（sudo pacman -S rclone）"; missing=1; }
+                               command -v age >/dev/null || { warn "缺少 age（sudo pacman -S age）"; missing=1; }; }
+  [ "$missing" -eq 0 ] || die "请先安装缺失依赖后重跑 setup"
+  info "依赖齐备"
+
+  echo
+  echo "== 2/5 配置文件（零配置原则：只装默认白名单）=="
+  setup_ensure_files
+
+  echo
+  echo "== 3/5 Cloudflare 与传输层（全自动）=="
+  setup_cloudflare
+
+  echo
+  echo "== 4/5 密钥层（age 内层加密，自动生成）=="
+  setup_age
+
+  echo
+  echo "== 5/5 首次备份与校验 =="
+  do_push cfg
+  do_push vault
+  do_verify cfg
+  do_verify vault
+
+  echo
+  info "setup 完成！"
+  if [ -f "$CONFIG_DIR/first-run-secrets.txt" ]; then
+    warn "还差一步（最重要）：把 $CONFIG_DIR/first-run-secrets.txt 录入密码管理器，然后 shred -u 删掉它"
+    warn "同时把 $CONFIG_DIR/age-identity.txt 存一份离线副本"
+  fi
+  if [ "$auto" != 1 ] && [ -t 0 ]; then
+    local ans
+    read -r -p "开启自动同步（每 24 小时）? [y/N] " ans || ans=""
+    case "$ans" in
+      y|Y) do_auto_sync on ;;
+      *) step "自动同步保持关闭（状态栏面板可随时开启）" ;;
+    esac
+  else
+    step "自动同步: omarchy-cfg-backup auto-sync on 可开启"
+  fi
+  note "状态栏: 左键开面板 · 右键立即同步（组件已随 install.sh 安装）"
+}
+
+# ---------------- 状态栏组件支撑 ----------------
+_record_state() { # kind snapname filecount
+  mkdir -p "$STATE_DIR"
+  local f="$STATE_DIR/state.json"
+  [ -f "$f" ] || echo '{}' > "$f"
+  jq --arg k "$1" --arg snap "$2" --argjson n "$3" --argjson now "$(date +%s)" \
+    '.[$k] = {snap:$snap, files:$n, epoch:$now, ts:(now | strftime("%Y-%m-%dT%H:%M:%SZ")),
+              pushCount: ((.[$k].pushCount // 0) + 1)}' \
+    "$f" > "$f.new" && mv "$f.new" "$f"
+}
+
+_record_verify() { # kind ok(true|false)
+  mkdir -p "$STATE_DIR"
+  local f="$STATE_DIR/state.json"
+  [ -f "$f" ] || echo '{}' > "$f"
+  jq --arg k "$1" --argjson ok "$2" --argjson now "$(date +%s)" \
+    '.verify = {kind:$k, ok:$ok, epoch:$now, ts:(now | strftime("%Y-%m-%dT%H:%M:%SZ"))}' \
+    "$f" > "$f.new" && mv "$f.new" "$f"
+}
+
+do_widget_status() {
+  # 输出单行 JSON 供状态栏/面板 QML 解析（无备份数据网络操作，秒回）
+  local f="$STATE_DIR/state.json"
+  local now; now=$(date +%s)
+  local auto_installed=false auto_enabled=false auto_active=false auto_next=""
+  if systemctl --user cat omarchy-cfg-backup.timer >/dev/null 2>&1; then
+    auto_installed=true
+    [ "$(systemctl --user is-enabled omarchy-cfg-backup.timer 2>/dev/null)" = enabled ] && auto_enabled=true
+    [ "$(systemctl --user is-active omarchy-cfg-backup.timer 2>/dev/null)" = active ] && auto_active=true
+    auto_next=$(systemctl --user list-timers omarchy-cfg-backup.timer --plain --no-legend 2>/dev/null | head -1 | awk '{print $1" "$2}')
+  fi
+  local auto_json
+  auto_json=$(printf '{"installed":%s,"enabled":%s,"active":%s,"next":"%s"}' \
+    "$auto_installed" "$auto_enabled" "$auto_active" "$auto_next")
+  local configured=true
+  if [ "$BACKEND" = rclone ]; then
+    if ! rclone listremotes 2>/dev/null | grep -qx "$REMOTE_CFG:" \
+       || ! rclone listremotes 2>/dev/null | grep -qx "$REMOTE_VAULT:"; then
+      configured=false
+    fi
+  fi
+  if [ ! -f "$INCLUDE_FILE" ] || [ ! -f "$VAULT_INCLUDE_FILE" ]; then
+    configured=false
+  fi
+  if [ -s "$f" ]; then
+    jq -c --argjson now "$now" --argjson auto "$auto_json" --argjson keepN "$KEEP_N" --argjson conf "$configured" '
+      def age_min: if .epoch then (($now - .epoch) / 60 | floor) else -1 end;
+      def lvl: if .epoch == null then 2
+               elif age_min <= 1440 then 0
+               elif age_min <= 4320 then 1 else 2 end;
+      . as $s
+      | {cfg: (($s.cfg // {}) + {ageMin: ($s.cfg // {} | age_min), level: ($s.cfg // {} | lvl)}),
+         vault: (($s.vault // {}) + {ageMin: ($s.vault // {} | age_min), level: ($s.vault // {} | lvl)})}
+      | . + {level: ([.cfg.level, .vault.level] | max),
+             verify: ($s.verify // null),
+             pushCount: (($s.cfg.pushCount // 0) + ($s.vault.pushCount // 0)),
+             autoSync: $auto, keepN: $keepN, configured: $conf, now: $now}' "$f"
+  else
+    jq -cnc --argjson auto "$auto_json" --argjson keepN "$KEEP_N" --argjson conf "$configured" --argjson now "$now" \
+      '{cfg:{ageMin:-1,level:2},vault:{ageMin:-1,level:2},level:2,verify:null,pushCount:0,autoSync:$auto,keepN:$keepN,configured:$conf,now:$now}'
+  fi
+}
+
+do_widget_push() {
+  # 状态栏点击触发：两仓备份 + 桌面通知（子 shell 包裹，die 不会中断通知流程）
+  if ( do_push cfg ) >/dev/null 2>&1 && ( do_push vault ) >/dev/null 2>&1; then
+    notify-send -a omarchy-cfg-backup "备份完成" "配置仓 + 密钥库已推送到 R2" 2>/dev/null || true
+  else
+    notify-send -u critical -a omarchy-cfg-backup "备份失败" "运行 omarchy-cfg-backup push 查看原因" 2>/dev/null || true
+    return 1
+  fi
+  qs -p "${OMARCHY_PATH:-/usr/share/omarchy}/shell" ipc call ocb.status refresh >/dev/null 2>&1 || true
+}
+
+do_widget_verify() {
+  # 面板"完整校验"按钮：两仓 verify + 桌面通知
+  if ( do_verify cfg ) >/dev/null 2>&1 && ( do_verify vault ) >/dev/null 2>&1; then
+    notify-send -a omarchy-cfg-backup "校验通过" "两仓快照完整（sha256 逐文件一致）" 2>/dev/null || true
+  else
+    notify-send -u critical -a omarchy-cfg-backup "校验失败" "运行 omarchy-cfg-backup verify 查看详情" 2>/dev/null || true
+    return 1
+  fi
+  qs -p "${OMARCHY_PATH:-/usr/share/omarchy}/shell" ipc call ocb.status refresh >/dev/null 2>&1 || true
+}
+
+do_auto_sync() {
+  # 自动同步开关（systemd user timer：每 24 小时 widget-push）
+  local action="${1:-status}"
+  case "$action" in
+    on)
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      systemctl --user enable --now omarchy-cfg-backup.timer >/dev/null 2>&1 \
+        || die "启用失败：systemd 单元未安装（先跑项目 install.sh）"
+      info "自动同步已开启（每 24 小时）"
+      ;;
+    off)
+      systemctl --user disable --now omarchy-cfg-backup.timer >/dev/null 2>&1 || true
+      info "自动同步已关闭"
+      ;;
+    status)
+      if systemctl --user cat omarchy-cfg-backup.timer >/dev/null 2>&1; then
+        local en ac nx
+        en=$(systemctl --user is-enabled omarchy-cfg-backup.timer 2>/dev/null || echo unknown)
+        ac=$(systemctl --user is-active omarchy-cfg-backup.timer 2>/dev/null || echo unknown)
+        nx=$(systemctl --user list-timers omarchy-cfg-backup.timer --plain --no-legend 2>/dev/null | head -1 | awk '{print $1" "$2}')
+        info "自动同步: $en / $ac / 下次: ${nx:-未排程}"
+      else
+        info "自动同步: 单元未安装（先跑项目 install.sh）"
+      fi
+      ;;
+    *) die "auto-sync 用法: on|off|status" ;;
+  esac
+}
+
+# ---------------- doctor ----------------
+do_doctor() {
+  local ok=0
+  echo "omarchy-cfg-backup v$VERSION · doctor"
+  echo
+  echo "== 依赖 =="
+  local c
+  for c in tar zstd jq sha256sum; do
+    if command -v "$c" >/dev/null; then info "$c: $(command -v "$c")"; else warn "$c: 未安装"; ok=1; fi
+  done
+  if [ "$BACKEND" = rclone ]; then
+    if command -v rclone >/dev/null; then info "rclone: $(command -v rclone)"; else warn "rclone: 未安装（pacman -S rclone）"; ok=1; fi
+  else
+    info "rclone: 不需要（BACKEND=local）"
+  fi
+  if [ "$VAULT_USE_AGE" = 1 ]; then
+    if command -v age >/dev/null; then info "age: $(command -v age)"; else warn "age: 未安装但 VAULT_USE_AGE=1"; ok=1; fi
+    [ -n "$AGE_RECIPIENT" ] && [ -n "$AGE_IDENTITY" ] || { warn "age 密钥未配置（AGE_RECIPIENT/AGE_IDENTITY）"; ok=1; }
+  else
+    info "age: 未启用（VAULT_USE_AGE=0）"
+  fi
+  echo
+  echo "== 配置 =="
+  info "BACKEND=$BACKEND  HOST_TAG=$HOST_TAG  KEEP_N=$KEEP_N"
+  [ -f "$INCLUDE_FILE" ] && info "include: $INCLUDE_FILE" || { warn "缺少 $INCLUDE_FILE"; ok=1; }
+  [ -f "$VAULT_INCLUDE_FILE" ] && info "vault include: $VAULT_INCLUDE_FILE" || { warn "缺少 $VAULT_INCLUDE_FILE"; ok=1; }
+  echo
+  echo "== 远端 =="
+  if _remote_reachable cfg && _remote_reachable vault; then
+    info "远端可达（cfg: $REMOTE_CFG / vault: $REMOTE_VAULT）"
+  else
+    warn "远端不可达（检查 rclone remote 配置）"; ok=1
+  fi
+  echo
+  echo "== 权限 =="
+  local f
+  for f in "$HOME/.config/rclone/rclone.conf" "$HOME/.rclone.conf" "$CONFIG_DIR/config"; do
+    if [ -f "$f" ]; then
+      local m; m=$(stat -c %a "$f")
+      if [ "$m" = "600" ]; then info "$f ($m)"; else warn "$f 权限 $m，建议 chmod 600"; ok=1; fi
+    fi
+  done
+  echo
+  [ "$ok" -eq 0 ] && info "体检通过" || warn "存在待处理项（见上）"
+  return "$ok"
+}
+
+# ---------------- vault scan（只读，绝不打印文件内容）----------------
+do_vault_scan() {
+  local emit_include=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --emit-include) [ $# -ge 2 ] || die "--emit-include 缺少参数"; emit_include=$2; shift 2 ;;
+      *) die "vault scan: 未知选项 $1" ;;
+    esac
+  done
+  SCAN_TMP=$(mktemp -d)
+  local ST="$SCAN_TMP"
+
+  local -a rule_names=(
+    "pem私钥" "aws-key" "api-token" "sk-token" "jwt"
+    "proxy-uri" "sub-url" "kv-secret"
+  )
+  local -a rule_regex=(
+    '-----BEGIN [A-Z0-9 ]*PRIVATE KEY'
+    'AKIA[0-9A-Z]{16}'
+    '(ghp_|gho_|ghu_|ghs_|github_pat_|xox[baprs]-)[A-Za-z0-9_=-]{10,}'
+    'sk-[A-Za-z0-9_-]{16,}'
+    'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}'
+    '\b(ss|vmess|trojan|vless|hysteria2?|tuic)://'
+    'https?://[^ \t"]*(uuid|token|key|password|pass|sub)='
+    '[\"'\'']?(api[_-]?key|apikey|access[_-]?key|secret|password|passwd|token|private[_-]?key|subscription)[\"'\'']?[[:space:]]*[:=][[:space:]]*[\"'\'']?[A-Za-z0-9/+=_.@:-]{8,}'
+  )
+  local -a rule_ci=( s s s s s s i i )
+  local -a rule_strength=( strong strong strong strong strong strong strong weak )
+
+  local name_re='(auth|oauth|credential|token|secret|password|passwd|netrc|pgpass|cookie|login|private|id_(rsa|ed25519|ecdsa|dsa)|hosts\.yml|\.env$|\.env\.|\.key$|\.pem$|\.p12$|\.pfx$|\.kdbx$|\.ppk$|wallet|keyring)'
+  local noise_re='(TrustTokenKeyCommitments|Trust Tokens|/country\.mmdb$|/cache\.db$|\.mmdb$)'
+
+  local roots=(
+    "$HOME" "$HOME/.config" "$HOME/.local/share" "$HOME/.local/state"
+    "$HOME/.ssh" "$HOME/.gnupg" "$HOME/.aws" "$HOME/.kube" "$HOME/.mozilla"
+  )
+  local depths=( 3 3 2 2 2 2 2 2 4 )
+  local prune_names=(
+    cache caches Cache GPUCache "Code Cache" "DawnCache" Crashpad "Service Worker"
+    IndexedDB "Local Storage" "Session Storage" logs log node_modules .git
+    themes plugins "CachedData" Extensions
+  )
+  local expr=() n
+  for n in "${prune_names[@]}"; do expr+=( -name "$n" -o ); done
+  unset 'expr[${#expr[@]}-1]'
+
+  local raw="$ST/raw"
+  : > "$raw"
+  local i
+  for i in "${!roots[@]}"; do
+    [ -e "${roots[$i]}" ] || continue
+    find "${roots[$i]}" -maxdepth "${depths[$i]}" \
+      \( "${expr[@]}" \) -prune \
+      -o -type f -size -8M -printf '%s\t%m\t%p\0' >> "$raw" 2>/dev/null || true
+  done
+
+  local small="$ST/small"; : > "$small"
+  local namehits="$ST/namehits"; : > "$namehits"
+  local total=0 scanned=0 size mode path low
+  declare -A filemode=() filesize=()
+  while IFS=$'\t' read -r -d '' size mode path; do
+    total=$((total + 1))
+    filemode[$path]=$mode
+    filesize[$path]=$size
+    if [ "$size" -eq 0 ]; then continue; fi
+    scanned=$((scanned + 1))
+    if [ "$size" -le 2097152 ]; then printf '%s\0' "$path" >> "$small"; fi
+    low=${path,,}
+    if [[ $low =~ $name_re ]] && ! [[ $path =~ $noise_re ]]; then
+      printf '%s\n' "$path" >> "$namehits"
+    fi
+  done < "$raw"
+
+  local name ci out f
+  for i in "${!rule_names[@]}"; do
+    name=${rule_names[$i]}; ci=${rule_ci[$i]}
+    out="$ST/hit_$name"; : > "$out"
+    if [ -s "$small" ]; then
+      if [ "$ci" = "i" ]; then
+        xargs -0 -r grep -IlEi -- "${rule_regex[$i]}" < "$small" > "$out" 2>/dev/null || true
+      else
+        xargs -0 -r grep -IlE -- "${rule_regex[$i]}" < "$small" > "$out" 2>/dev/null || true
+      fi
+    fi
+  done
+
+  declare -A filesig=()
+  for i in "${!rule_names[@]}"; do
+    name=${rule_names[$i]}
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      filesig[$f]="${filesig[$f]:-} ${name}:${rule_strength[$i]}"
+    done < "$ST/hit_$name"
+  done
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    filesig[$f]="${filesig[$f]:-} namehit"
+  done < "$namehits"
+  for f in "${!filemode[@]}"; do
+    if [ "${filesize[$f]}" -gt 0 ] && { [ "${filemode[$f]}" = "600" ] || [ "${filemode[$f]}" = "400" ]; }; then
+      filesig[$f]="${filesig[$f]:-} perm-only"
+    fi
+  done
+
+  local classB="$ST/classB" classS="$ST/classS" classC="$ST/classC" permwarn="$ST/permwarn"
+  : > "$classB"; : > "$classS"; : > "$classC"; : > "$permwarn"
+  local sig hasstrong hasweak hasname
+  for f in "${!filesig[@]}"; do
+    sig=${filesig[$f]}
+    hasstrong=0; hasweak=0; hasname=0
+    if [[ $sig == *":strong"* ]]; then hasstrong=1; fi
+    if [[ $sig == *":weak"* ]]; then hasweak=1; fi
+    if [[ $sig == *"namehit"* ]]; then hasname=1; fi
+    if [ "$hasstrong" -eq 1 ] || { { [ "$hasname" -eq 1 ] || [ "$hasweak" -eq 1 ]; } && { [ "${filemode[$f]}" = "600" ] || [ "${filemode[$f]}" = "400" ]; }; }; then
+      printf '%s\t%s\t%s\t%s\n' "${filemode[$f]}" "${filesize[$f]}" "$f" "${sig# }" >> "$classB"
+    elif [ "$hasname" -eq 1 ] || [ "$hasweak" -eq 1 ]; then
+      printf '%s\t%s\t%s\t%s\n' "${filemode[$f]}" "${filesize[$f]}" "$f" "${sig# }" >> "$classS"
+    else
+      printf '%s\t%s\t%s\t%s\n' "${filemode[$f]}" "${filesize[$f]}" "$f" "${sig# }" >> "$classC"
+    fi
+    if { [ "$hasstrong" -eq 1 ] || [ "$hasname" -eq 1 ]; } && [ "${filemode[$f]}" != "600" ] && [ "${filemode[$f]}" != "400" ]; then
+      printf '%s\t%s\n' "${filemode[$f]}" "$f" >> "$permwarn"
+    fi
+  done
+
+  echo "vault scan — 只读扫描：共见 $total 个文件，非空 $scanned 个参与判定"
+  echo
+  local cnt
+  cnt=$(wc -l < "$classB")
+  echo "== B 类 · 确定含密钥（收进 vault）· $cnt 个 =="
+  if [ "$cnt" -gt 0 ]; then
+    sort -t$'\t' -k3 "$classB" | while IFS=$'\t' read -r mode size f sig; do
+      printf '  %s  %sB  %s\n      规则: %s\n' "$mode" "$size" "$f" "${sig// /, }"
+    done
+  fi
+  echo
+  cnt=$(wc -l < "$classS")
+  echo "== 疑似 · 人工确认 · $cnt 个 =="
+  if [ "$cnt" -gt 0 ]; then
+    sort -t$'\t' -k3 "$classS" | while IFS=$'\t' read -r mode size f sig; do
+      printf '  %s  %sB  %s\n      规则: %s\n' "$mode" "$size" "$f" "${sig// /, }"
+    done
+  fi
+  echo
+  cnt=$(wc -l < "$classC")
+  echo "== C 类 · 状态/低置信（不进 vault）· $cnt 个（最多列 10 个）=="
+  if [ "$cnt" -gt 0 ]; then
+    sort -t$'\t' -k3 "$classC" | sed -n '1,10p' | while IFS=$'\t' read -r mode size f sig; do
+      printf '  %s  %sB  %s  [%s]\n' "$mode" "$size" "$f" "$sig"
+    done
+    if [ "$cnt" -gt 10 ]; then echo "  …其余省略"; fi
+  fi
+  echo
+  cnt=$(wc -l < "$permwarn")
+  echo "== 权限告警（含密钥特征但权限非 600/400）· $cnt 个 =="
+  if [ "$cnt" -gt 0 ]; then
+    sort -k2 "$permwarn" | while IFS=$'\t' read -r mode f; do
+      printf '  %s  %s  → 建议 chmod 600\n' "$mode" "$f"
+    done
+  fi
+  echo
+  echo "说明: 内容特征为启发式匹配，可能误报/漏报；B 类请人工过目后再加入 vault-include.txt。"
+  if [ -n "$emit_include" ]; then
+    {
+      echo "# vault-include.txt — 由 vault scan 生成，请人工确认后使用"
+      echo "# 生成时间: $(date '+%F %T %z')"
+      sort -t$'\t' -k3 "$classB" | cut -f3
+    } > "$emit_include"
+    echo "已写出候选清单: $emit_include"
+  fi
+}
+
+# ---------------- 分发 ----------------
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    push)   do_push cfg "$@" ;;
+    list)   do_list cfg "$@" ;;
+    pull)   do_pull cfg "$@" ;;
+    status) do_status cfg "$@" ;;
+    verify) do_verify cfg "$@" ;;
+    vault)
+      local sub="${1:-scan}"; shift || true
+      case "$sub" in
+        scan)   do_vault_scan "$@" ;;
+        push)   do_push vault "$@" ;;
+        list)   do_list vault "$@" ;;
+        pull)   do_pull vault "$@" ;;
+        status) do_status vault "$@" ;;
+        verify) do_verify vault "$@" ;;
+        *) die "未知 vault 子命令: $sub" ;;
+      esac
+      ;;
+    widget-status) do_widget_status "$@" ;;
+    widget-push) do_widget_push "$@" ;;
+    widget-verify) do_widget_verify "$@" ;;
+    auto-sync) do_auto_sync "$@" ;;
+    setup) do_setup "$@" ;;
+    doctor)  do_doctor "$@" ;;
+    version) echo "omarchy-cfg-backup v$VERSION" ;;
+    help|-h|--help) usage ;;
+    *) die "未知命令: $cmd（omarchy-cfg-backup help）" ;;
+  esac
+}
+
+main "$@"

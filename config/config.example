@@ -1,0 +1,24 @@
+# omarchy-cfg-backup 配置示例
+# 复制到 ~/.config/omarchy-cfg-backup/config 后按需修改（权限 600）。
+
+# 后端: rclone（上云）| local（本地目录，测试用）
+BACKEND=rclone
+
+# rclone 远端名（配置里含 bucket，如 r2-crypt -> omarchy-cfg-backup）
+REMOTE_CFG=r2-crypt
+REMOTE_VAULT=r2-vault-crypt
+
+# BACKEND=local 时的本地"远端"根目录
+# LOCAL_ROOT=$HOME/.local/share/omarchy-cfg-backup/remote
+
+# 对象路径里的主机标识（默认取 hostname；多机共用 bucket 时保持唯一）
+# HOST_TAG=my-machine
+
+# 每仓保留的时间戳快照数量
+KEEP_N=10
+
+# vault 的 age 内层加密（推荐启用；需要 age-keygen 生成的密钥对）
+# 加密用公钥，解密用私钥文件；私钥必须同时存密码管理器/离线副本
+VAULT_USE_AGE=0
+# AGE_RECIPIENT=age1...
+# AGE_IDENTITY=$HOME/.config/omarchy-cfg-backup/age-identity.txt

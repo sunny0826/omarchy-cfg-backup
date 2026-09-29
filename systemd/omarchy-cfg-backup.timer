@@ -1,0 +1,11 @@
+[Unit]
+Description=每 24 小时自动备份 Omarchy 配置与密钥到 R2
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+Persistent=true
+Unit=omarchy-cfg-backup.service
+
+[Install]
+WantedBy=timers.target
