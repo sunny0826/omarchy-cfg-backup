@@ -118,6 +118,9 @@ assert "setup 二次执行幂等" grep -q '白名单已存在，跳过' "$T/setu
 "$CLI" widget-status > "$T/ws3.json" 2>&1
 assert "setup 后 configured=true" bash -c 'test "$(jq -r .configured "$0")" = true' "$T/ws3.json"
 
+echo "== 发布站点 =="
+assert "docs/index.html 与 bootstrap.sh 同步" cmp -s "$PROJ/bootstrap.sh" "$PROJ/docs/index.html"
+
 echo
 echo "结果: $pass 通过 · $fail 失败"
 [ "$fail" -eq 0 ]
