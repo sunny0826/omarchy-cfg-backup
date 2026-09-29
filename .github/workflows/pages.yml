@@ -1,0 +1,44 @@
+name: Deploy installer site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - bootstrap.sh
+      - docs/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build site（bootstrap.sh 即站点根内容）
+        run: |
+          mkdir -p _site
+          cp bootstrap.sh _site/index.html
+          cp docs/CNAME _site/CNAME
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
